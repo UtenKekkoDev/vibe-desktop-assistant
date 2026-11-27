@@ -1,0 +1,1998 @@
+//! The whole UI: one non-activating bar that expands while you hold the trigger
+//! key, becomes a short card while you dictate, and collapses to a dot.
+
+use crate::audio::{cancel_recording, recording_level, take_recording_error};
+use crate::config;
+use crate::holdkey;
+use crate::services::{self, FeedbackLevel, FinishEvent, FinishInputResult};
+use crate::settings::{self, SettingsAction, SettingsView};
+use crate::state::{InputMode, InputState, ModelProvider, NativeAppState};
+use crate::task::TaskControl;
+use crate::tray::{TrayAction, TrayController};
+use crate::voice_mode::{self, ModeCommand};
+use eframe::egui::{self, Align2, Color32, Context, FontId, Pos2, Rect, Stroke, StrokeKind, vec2};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+pub const BAR_SIZE: [f32; 2] = [384.0, 64.0];
+pub const WINDOW_TITLE: &str = "Vibe Desktop Assistant";
+
+/// Resting size: a small transparent square holding a single dot.
+const DOT_SIZE: f32 = 28.0;
+/// Result card: wider than the bar, and as tall as the text needs.
+const CARD_W: f32 = 440.0;
+const CARD_MIN_H: f32 = 104.0;
+const CARD_MAX_H: f32 = 380.0;
+const CARD_PAD: f32 = 18.0;
+const RESULT_FONT: f32 = 14.0;
+/// Longest transcript kept on screen before it is clipped with an ellipsis.
+const RESULT_CHARS: usize = 800;
+
+const SURFACE: Color32 = Color32::from_rgb(26, 28, 34);
+const BORDER: Color32 = Color32::from_rgb(58, 62, 72);
+const TEXT: Color32 = Color32::from_rgb(232, 234, 239);
+const MUTED: Color32 = Color32::from_rgb(146, 151, 162);
+const RECORDING: Color32 = Color32::from_rgb(255, 107, 94);
+const DONE: Color32 = Color32::from_rgb(109, 211, 160);
+const ERROR: Color32 = Color32::from_rgb(240, 118, 108);
+
+const MIN_HOLD: Duration = Duration::from_millis(280);
+const MAX_HOLD: Duration = Duration::from_secs(300);
+const RESULT_LINGER: Duration = Duration::from_millis(1500);
+const ERROR_LINGER: Duration = Duration::from_secs(4);
+
+enum Phase {
+    Idle,
+    Awaiting,
+    Recording,
+    Processing,
+    Done { until: Instant, level: FeedbackLevel },
+}
+
+pub struct VoiceLiteApp {
+    speech: crate::speech::SpeechOutput,
+    ctx: Context,
+    state: NativeAppState,
+    phase: Phase,
+    recording_started_at: Option<Instant>,
+    pending: Option<Receiver<FinishEvent>>,
+    choosing_mode: bool,
+    esc_down: bool,
+    active_task: Option<TaskControl>,
+    health_pending: Option<Receiver<(bool, String, String)>>,
+    model_ready: bool,
+    tray: Option<TrayController>,
+    settings_open: bool,
+    settings_view: Arc<Mutex<SettingsView>>,
+    settings_tx: Sender<SettingsAction>,
+    settings_rx: Receiver<SettingsAction>,
+    result_text: String,
+    result_shown: String,
+    paste_note: Option<String>,
+    saved_config: serde_json::Value,
+    retry_save_at: Option<Instant>,
+    last_down: bool,
+    started_at: Instant,
+    placed: bool,
+    peer_rect: Option<[i32; 4]>,
+    next_peer_check: Instant,
+    geometry: [f32; 2],
+}
+
+impl Drop for VoiceLiteApp {
+    fn drop(&mut self) {
+        config::lifecycle("cleanup begin");
+        self.speech.shutdown();
+        config::lifecycle("tts stopped");
+        if let Some(task) = &self.active_task {
+            task.cancel();
+        }
+        cancel_recording();
+        config::lifecycle("audio stopped");
+        let _ = config::save(&config::snapshot(&self.state));
+        config::lifecycle("settings saved");
+        self.tray.take();
+        config::lifecycle("tray removed");
+    }
+}
+
+impl eframe::App for VoiceLiteApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // wgpu composites per-pixel alpha, so the desktop shows through.
+        [0.0; 4]
+    }
+
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            config::lifecycle("root close received");
+            return;
+        }
+        self.poll_tray();
+        self.demo_tick();
+        self.poll_health();
+        self.poll_speech();
+        self.watch_recording();
+
+        let settings_focused = if self.settings_open {
+            let (keep, focused) = settings::show(ctx, &self.settings_view, &self.settings_tx);
+            if !keep {
+                self.settings_open = false;
+            }
+            self.drain_settings();
+            self.settings_open && focused
+        } else {
+            false
+        };
+        self.poll_finish();
+        self.poll_hold_key(settings_focused);
+        self.expire_phase();
+
+        // Resize to fit the current state, then paint into that size.
+        if !self.placed && self.started_at.elapsed() > Duration::from_millis(300) {
+            self.placed = true;
+        }
+        if self.placed {
+            self.sync_geometry(ctx);
+        }
+        self.paint(ctx);
+        self.persist();
+
+        let cadence = if matches!(self.phase, Phase::Recording) {
+            16
+        } else {
+            40
+        };
+        ctx.request_repaint_after(Duration::from_millis(cadence));
+    }
+}
+
+impl VoiceLiteApp {
+    pub fn new(ctx: &Context) -> Self {
+        let mut state = NativeAppState::default();
+        let first_launch = !config::has_saved_settings();
+        let load_error = config::load(&mut state).err();
+        let (settings_tx, settings_rx) = mpsc::channel();
+        let view = Arc::new(Mutex::new(SettingsView::from_state(&state)));
+        let tooltip = format!(
+            "Vibe Desktop Assistant · 按住{}说话",
+            holdkey::label(&state.hold_key)
+        );
+        let mut app = Self {
+            speech: crate::speech::SpeechOutput::default(),
+            ctx: ctx.clone(),
+            state,
+            phase: Phase::Idle,
+            recording_started_at: None,
+            pending: None,
+            choosing_mode: false,
+            esc_down: false,
+            active_task: None,
+            health_pending: None,
+            model_ready: false,
+            tray: None,
+            settings_open: first_launch,
+            settings_view: view,
+            settings_tx,
+            settings_rx,
+            result_text: String::new(),
+            result_shown: String::new(),
+            paste_note: None,
+            saved_config: serde_json::Value::Null,
+            retry_save_at: None,
+            last_down: false,
+            started_at: Instant::now(),
+            placed: false,
+            peer_rect: None,
+            next_peer_check: Instant::now(),
+            // Zero forces the first sync_geometry to size and place the window.
+            geometry: [0.0, 0.0],
+        };
+        app.saved_config = config::snapshot(&app.state);
+        app.tray = TrayController::install(
+            app.state.input_mode,
+            app.state.auto_paste,
+            &tooltip,
+            ctx,
+            Self::request_close,
+        )
+        .ok();
+        app.start_health_check(false);
+        if app.state.tts_enabled
+            && app.state.input_mode != InputMode::DesktopAssistant
+            && let Err(error) = app.speech.start()
+        {
+            app.speech.status = format!("语音不可用：{error}");
+        }
+        if let Some(error) = load_error {
+            app.set_error(format!("设置读取失败：{error}"));
+        }
+        app
+    }
+
+    /// Env-gated visual check: pins one bar state without touching the mic.
+    /// `VIBE_DESKTOP_DEMO=rec|proc|done|err|long`
+    fn demo_tick(&mut self) {
+        let Some(mode) = std::env::var_os("VIBE_DESKTOP_DEMO") else {
+            return;
+        };
+        let mode = mode.to_string_lossy().to_string();
+        let next = match mode.as_str() {
+            "rec" => Phase::Recording,
+            "proc" => Phase::Processing,
+            "done" | "long" => Phase::Done {
+                until: Instant::now() + Duration::from_secs(3600),
+                level: FeedbackLevel::Success,
+            },
+            "err" => Phase::Done {
+                until: Instant::now() + Duration::from_secs(3600),
+                level: FeedbackLevel::Error,
+            },
+            _ => Phase::Idle,
+        };
+        let changed = std::mem::discriminant(&self.phase) != std::mem::discriminant(&next);
+        self.phase = next;
+        if changed {
+            self.result_text = if mode == "err" {
+                "模型未就绪 · 托盘 → 设置".to_string()
+            } else if mode == "long" {
+                "帮我把登录页的报错文案全部改成中文，顺便把错误码映射抽成一个单独的函数，\
+                 另外检查一下 refresh token 过期以后有没有重新登录的兜底逻辑，最后再补一版单元测试。"
+                    .to_string()
+            } else {
+                "把登录页的错误提示改成中文".to_string()
+            };
+            self.recording_started_at = Some(Instant::now() - Duration::from_secs(3));
+            self.raise_bar();
+        }
+    }
+
+    fn poll_tray(&mut self) {
+        let Some(action) = self.tray.as_ref().and_then(|tray| tray.poll()) else {
+            return;
+        };
+        match action {
+            TrayAction::Settings => self.open_settings(),
+            TrayAction::Mode(mode) => self.set_mode(mode),
+            TrayAction::ToggleAutoPaste => self.set_auto_paste(!self.state.auto_paste),
+            TrayAction::CopyLastResult => self.copy_last_result(),
+        }
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.input_mode = self.state.input_mode;
+            view.auto_paste = self.state.auto_paste;
+        }
+    }
+
+    fn request_close(ctx: &Context) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+        // Deliver a native close event even when the floating bar is inactive.
+        let hwnd = own_window();
+        let posted = hwnd != 0 && unsafe { PostMessageW(hwnd as _, WM_CLOSE, 0, 0) } != 0;
+        config::lifecycle(&format!("close requested hwnd={hwnd} posted={posted}"));
+        if !posted {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
+    }
+
+    fn copy_last_result(&mut self) {
+        if self.state.last_final_result.is_empty() {
+            return;
+        }
+        let copied = services::write_clipboard(&self.state.last_final_result).is_ok();
+        if let Some(tray) = &self.tray {
+            tray.show_copy_status(copied);
+        }
+        if self.state.clarification.is_none()
+            && matches!(self.phase, Phase::Idle | Phase::Done { .. })
+        {
+            self.result_text.clone_from(&self.state.last_final_result);
+            self.paste_note = Some(if copied {
+                "上次结果已复制 · 可按 Ctrl+V 粘贴".into()
+            } else {
+                "剪贴板不可用 · 从托盘再次复制".into()
+            });
+            self.phase = Phase::Done {
+                until: Instant::now() + if copied { RESULT_LINGER } else { ERROR_LINGER },
+                level: FeedbackLevel::Success,
+            };
+            self.raise_bar();
+        }
+    }
+
+    fn start_health_check(&mut self, full: bool) {
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.checking = true;
+            view.status = "正在检查模型…".into();
+        }
+        let state = self.state.clone();
+        let (tx, rx) = mpsc::channel();
+        self.health_pending = Some(rx);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let (ok, message) = settings::probe(&state, full);
+            let mic = crate::audio::input_status();
+            let _ = tx.send((ok, message, mic));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_health(&mut self) {
+        let Some(rx) = self.health_pending.as_ref() else {
+            return;
+        };
+        let (ok, message, microphone) = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => (
+                false,
+                "模型检查意外结束，请重新检查。".into(),
+                "请重新检查设备".into(),
+            ),
+        };
+        self.health_pending = None;
+        self.model_ready = ok;
+        self.debug_log(&format!("health ready={ok} status={message}"));
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.checking = false;
+            view.status = message;
+            view.microphone = microphone;
+        }
+        if !ok && !self.settings_open {
+            self.open_settings();
+        }
+    }
+
+    fn poll_finish(&mut self) {
+        let received = match self.pending.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => Some(Ok(result)),
+            Some(Err(TryRecvError::Disconnected)) => Some(Err(())),
+            _ => None,
+        };
+        let Some(received) = received else {
+            return;
+        };
+        self.pending = None;
+        self.active_task = None;
+        match received {
+            Ok(FinishEvent::NoVerbatimText) => {
+                self.set_error("没有可直出的上一段原话。可以说“正文，这句直接输入”。")
+            }
+            Ok(FinishEvent::Mode(command)) => self.handle_mode_command(command),
+            Ok(FinishEvent::Dictation(result)) if self.choosing_mode => {
+                // A successful picker answer is always a Mode event. An ASR
+                // error keeps both the picker and any suspended interview.
+                self.set_error(result.status_message);
+            }
+            Ok(FinishEvent::Dictation(result)) => self.accept_finish_result(*result),
+            Err(()) => self.set_error("识别进程意外退出，请重试"),
+        }
+    }
+
+    fn say(&mut self, text: &str) -> Option<u64> {
+        if !self.state.tts_enabled {
+            return None;
+        }
+        match self.speech.speak(text) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                self.speech.status = format!("语音不可用：{error}；文字结果仍保留");
+                None
+            }
+        }
+    }
+
+    fn speak_for_turn(&mut self, text: &str) {
+        if let Some(id) = self.say(text)
+            && let Ok(mut view) = self.settings_view.lock()
+        {
+            view.latency.attach_speech(id);
+        }
+    }
+
+    fn poll_speech(&mut self) {
+        if let Err(error) = self.speech.poll() {
+            self.speech.status = format!("语音不可用：{error}");
+            config::lifecycle("tts error; text retained");
+        }
+        if let Ok(mut view) = self.settings_view.lock() {
+            for mark in self.speech.output_times.drain(..) {
+                view.latency.first_output(mark);
+            }
+            view.tts_status = self.speech.status.clone();
+            view.tts_enabled = self.state.tts_enabled;
+            view.clarifying = self.state.clarification.is_some();
+        }
+    }
+
+    fn cancel_clarification(&mut self) {
+        self.reset_input();
+        self.state.clarification = None;
+        self.state.last_interview_turn.clear();
+    }
+
+    fn reset_input(&mut self) {
+        self.choosing_mode = false;
+        self.speech.stop();
+        if let Some(task) = self.active_task.take() {
+            task.cancel();
+        }
+        self.pending = None;
+        cancel_recording();
+        self.recording_started_at = None;
+        self.phase = Phase::Idle;
+        self.state.input_state = InputState::Idle;
+    }
+
+    fn show_mode_question(&mut self, prompt: &str) {
+        self.choosing_mode = true;
+        self.state.input_state = InputState::Idle;
+        self.phase = Phase::Awaiting;
+        self.result_text = prompt.into();
+        self.paste_note = Some(format!(
+            "按住 {} 回答 · 说“取消”或按 Esc 返回",
+            holdkey::label(&self.state.hold_key)
+        ));
+        self.raise_bar();
+    }
+
+    fn handle_mode_command(&mut self, command: ModeCommand) {
+        match command {
+            ModeCommand::Ask | ModeCommand::Retry => {
+                let prompt = if command == ModeCommand::Ask {
+                    voice_mode::QUESTION
+                } else {
+                    voice_mode::RETRY
+                };
+                self.show_mode_question(prompt);
+                self.speak_for_turn(prompt);
+                return;
+            }
+            ModeCommand::Cancel => {
+                self.reset_input();
+                self.result_text = format!("已取消切换，当前是{}", self.state.input_mode.label());
+            }
+            ModeCommand::Choose(mode) => {
+                let already_selected = self.state.input_mode == mode;
+                self.set_mode(mode);
+                self.state.input_state = InputState::Idle;
+                let receipt = if already_selected {
+                    format!("当前已是{}。", mode.label())
+                } else {
+                    format!("已切换到{}。", mode.label())
+                };
+                self.speak_for_turn(&receipt);
+                self.result_text = receipt;
+            }
+        }
+        self.paste_note = Some(if self.state.clarification.is_some() {
+            "继续上一个问题".into()
+        } else {
+            format!("按住 {} 开始说话", holdkey::label(&self.state.hold_key))
+        });
+        self.phase = Phase::Done {
+            until: Instant::now() + RESULT_LINGER,
+            level: FeedbackLevel::Success,
+        };
+        self.raise_bar();
+    }
+
+    fn set_auto_paste(&mut self, on: bool) {
+        self.state.auto_paste = on;
+        if let Some(tray) = &self.tray {
+            tray.set_auto_paste(on);
+        }
+    }
+
+    fn set_mode(&mut self, mode: InputMode) {
+        if self.state.input_mode != mode {
+            self.cancel_clarification();
+            self.state.input_mode = mode;
+        } else if self.choosing_mode {
+            self.reset_input();
+            self.restore_question();
+        }
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.input_mode = mode;
+        }
+        if let Some(tray) = &self.tray {
+            tray.set_mode(mode);
+        }
+    }
+
+    fn accept_finish_result(&mut self, mut result: FinishInputResult) {
+        let desktop = self.state.input_mode == InputMode::DesktopAssistant;
+        result.auto_paste &= self.state.auto_paste && !desktop;
+        let auto_paste = result.auto_paste;
+        let ai_note = result.ai_note.clone();
+        let review = result.review_required;
+        let footer = result.clarification.as_ref().map(question_footer);
+        let question = result
+            .clarification
+            .as_ref()
+            .map(|c| c.question.text().to_owned());
+        let feedback_level = result.feedback_level;
+        let spoken = if desktop && (feedback_level.is_some() || result.input_state == InputState::Success) {
+            result.delivered_text.clone()
+        } else {
+            services::spoken_feedback(&result)
+        };
+        let display = if desktop || ai_note.is_some() {
+            result.delivered_text.clone()
+        } else {
+            result.raw_text.clone()
+        };
+        let target = self.state.delivery_target;
+        let paste_error = services::apply_finish_result(&mut self.state, result, |result| {
+            services::auto_paste_result(result, target)
+        });
+        if !self.state.last_final_result.is_empty()
+            && let Some(tray) = &self.tray
+        {
+            tray.enable_copy();
+        }
+        let ok = self.state.input_state == InputState::Success;
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.raw_text = self.state.raw_text.clone();
+            view.delivered_text = self.state.delivered_text.clone();
+            view.ai_status = self.state.ai_status.clone();
+        }
+        let ai_failed = ai_note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("AI 整理失败"));
+        let cancelled = ai_note.as_deref() == Some("已取消整理");
+        self.result_text = if cancelled {
+            "已取消本次整理".into()
+        } else if ai_failed {
+            if self.state.input_mode == InputMode::Interview {
+                "AI 整理失败，访谈内容已保留。可以继续补充，或再说“先整理到这里”重试汇总。".into()
+            } else if self.state.clarification.is_some() {
+                "AI 整理失败，回答已保留。可稍后再试，或按 Esc 取消。".into()
+            } else {
+                "AI 整理失败。可在设置的「最近一次转写与输出」中复制原文。".into()
+            }
+        } else if ok {
+            question.clone().or(display).unwrap_or_default()
+        } else {
+            self.state.status_message.clone()
+        };
+        let delivery = if review {
+            "未自动粘贴"
+        } else if paste_error.is_some() {
+            "自动粘贴未完成 · 托盘可复制上次结果"
+        } else if !auto_paste {
+            "自动粘贴已关闭"
+        } else {
+            "已复制并发送粘贴快捷键"
+        };
+        self.paste_note = Some(if desktop {
+            self.state.input_mode.label().into()
+        } else if cancelled {
+            "未自动粘贴 · 可以开始新的口述".into()
+        } else if ai_failed {
+            ai_note
+                .as_deref()
+                .and_then(|note| note.split_once("未自动粘贴："))
+                .map_or_else(
+                    || "未自动粘贴 · 可在设置中查看原因".into(),
+                    |(_, reason)| reason.to_owned(),
+                )
+        } else if let Some(footer) = footer {
+            footer.into()
+        } else if review {
+            "AI 仍有待确认项 · 请查看文字结果".into()
+        } else if let Some(note) = ai_note.as_deref() {
+            format!("{note} · {delivery}")
+        } else {
+            delivery.into()
+        });
+        self.phase = if self.state.clarification.is_some() {
+            Phase::Awaiting
+        } else {
+            Phase::Done {
+                until: Instant::now()
+                    + if ok && !review && feedback_level != Some(FeedbackLevel::Warning) {
+                        RESULT_LINGER
+                    } else {
+                        ERROR_LINGER
+                    },
+                level: feedback_level.unwrap_or(if ok { FeedbackLevel::Success } else { FeedbackLevel::Error }),
+            }
+        };
+        if let Some(text) = spoken {
+            self.speak_for_turn(&text);
+        }
+        self.raise_bar();
+    }
+
+    fn watch_recording(&mut self) {
+        if std::env::var_os("VIBE_DESKTOP_DEMO").is_some() {
+            return;
+        }
+        if !matches!(self.phase, Phase::Recording) {
+            return;
+        }
+        if let Some(error) = take_recording_error() {
+            cancel_recording();
+            self.set_error(error);
+        } else if self
+            .recording_started_at
+            .is_some_and(|started| started.elapsed() >= MAX_HOLD)
+        {
+            self.stop_recording();
+        }
+    }
+
+    fn poll_hold_key(&mut self, settings_focused: bool) {
+        if std::env::var_os("VIBE_DESKTOP_DEMO").is_some() {
+            return;
+        }
+        let down = holdkey::is_down(&self.state.hold_key);
+        let esc =
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) } < 0;
+        if esc && !self.esc_down && !settings_focused {
+            if self.choosing_mode {
+                self.handle_mode_command(ModeCommand::Cancel);
+            } else if self.state.clarification.is_some()
+                && matches!(self.phase, Phase::Awaiting | Phase::Done { .. })
+            {
+                self.cancel_clarification();
+            }
+        }
+        self.esc_down = esc;
+        self.handle_hold_key(down, settings_focused);
+    }
+
+    fn handle_hold_key(&mut self, down: bool, settings_focused: bool) {
+        let pressed = down && !self.last_down;
+        if down != self.last_down {
+            self.last_down = down;
+            self.debug_log(&format!("hold={down}"));
+        }
+        if pressed
+            && !settings_focused
+            && matches!(
+                self.phase,
+                Phase::Idle | Phase::Awaiting | Phase::Done { .. }
+            )
+        {
+            if let Some(message) = holdkey::conflict_notice(&self.state.hold_key) {
+                self.open_settings();
+                self.set_error(message);
+            } else {
+                self.start_recording();
+            }
+        } else if !down && matches!(self.phase, Phase::Recording) {
+            self.stop_recording();
+        }
+    }
+
+    fn start_recording(&mut self) {
+        self.speech.stop();
+        if !self.model_ready {
+            self.set_error("模型未就绪 · 托盘 → 设置");
+            self.open_settings();
+            return;
+        }
+        self.state.local_model_ready =
+            self.state.model_provider == ModelProvider::Local && self.model_ready;
+        self.state.qwen_ready =
+            self.state.model_provider == ModelProvider::OnlineQwen && self.model_ready;
+        services::begin_input(&mut self.state);
+        self.debug_log(&format!(
+            "begin state={:?} message={}",
+            self.state.input_state, self.state.status_message
+        ));
+        if self.state.input_state == InputState::Recording {
+            self.phase = Phase::Recording;
+            self.recording_started_at = Some(Instant::now());
+            self.paste_note = None;
+            self.raise_bar();
+        } else {
+            let message = self.state.status_message.clone();
+            self.set_error(message);
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let released = crate::latency::ReleaseTime::now();
+        let elapsed = self
+            .recording_started_at
+            .take()
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        self.debug_log(&format!("stop elapsed={elapsed:?}"));
+        if elapsed < MIN_HOLD {
+            cancel_recording();
+            self.state.input_state = InputState::Idle;
+            self.set_error("说话太短，按住再说一次");
+            return;
+        }
+        match services::begin_finish_input(&mut self.state) {
+            Ok(work) => {
+                let task = TaskControl::new(Duration::from_secs(120));
+                if let Ok(mut view) = self.settings_view.lock() {
+                    view.latency.begin(
+                        released,
+                        self.state.input_mode,
+                        self.state.clarification.is_some(),
+                        &task,
+                    );
+                }
+                self.active_task = Some(task.clone());
+                let (tx, rx) = mpsc::channel();
+                self.pending = Some(rx);
+                self.phase = Phase::Processing;
+                let ctx = self.ctx.clone();
+                let choosing_mode = self.choosing_mode;
+                thread::spawn(move || {
+                    let result = services::run_finish_input_work(work, &task, choosing_mode);
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                });
+            }
+            Err(error) => {
+                cancel_recording();
+                self.state.input_state = InputState::Error;
+                self.set_error(format!("无法结束录音：{error:#}"));
+            }
+        }
+    }
+
+    fn expire_phase(&mut self) {
+        let expired = match &self.phase {
+            Phase::Done { until, .. } => Instant::now() >= *until,
+            _ => false,
+        };
+        if expired {
+            self.restore_question();
+        }
+    }
+
+    fn restore_question(&mut self) {
+        if self.choosing_mode {
+            self.show_mode_question(voice_mode::QUESTION);
+        } else if let Some(pending) = &self.state.clarification {
+            self.result_text = pending.question.text().to_owned();
+            self.paste_note = Some(question_footer(pending).into());
+            self.phase = Phase::Awaiting;
+        } else {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    fn set_error(&mut self, message: impl Into<String>) {
+        if let Some(task) = self.active_task.take() {
+            task.cancel();
+        }
+        self.pending = None;
+        cancel_recording();
+        self.recording_started_at = None;
+        self.state.input_state = InputState::Error;
+        self.paste_note = None;
+        let message = message.into();
+        self.debug_log(&format!("error: {message}"));
+        self.result_text = message;
+        self.phase = Phase::Done {
+            until: Instant::now() + ERROR_LINGER,
+            level: FeedbackLevel::Error,
+        };
+        self.raise_bar();
+    }
+
+    /// Diagnostics stay off unless VIBE_DESKTOP_DEBUG is set.
+    fn debug_log(&self, message: &str) {
+        use std::io::Write;
+        if std::env::var_os("VIBE_DESKTOP_DEBUG").is_none() {
+            return;
+        }
+        let path = std::env::temp_dir().join("vibe-desktop-debug.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+
+    /// Re-assert topmost z-order so the bar is not hidden by another overlay.
+    fn raise_bar(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+        };
+        let hwnd = own_window();
+        if hwnd != 0 {
+            unsafe {
+                SetWindowPos(
+                    hwnd as _,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+    }
+
+    fn drain_settings(&mut self) {
+        while let Ok(action) = self.settings_rx.try_recv() {
+            if matches!(
+                &action,
+                SettingsAction::Online(_)
+                    | SettingsAction::LocalDir(_)
+                    | SettingsAction::QwenKey(_)
+                    | SettingsAction::QwenModel(_)
+                    | SettingsAction::QwenUrl(_)
+            ) {
+                // Discard checks made for the previous model configuration.
+                self.health_pending = None;
+                if let Ok(mut view) = self.settings_view.lock() {
+                    view.checking = false;
+                    view.status = "配置已修改，请检查模型或关闭设置后自动检查。".into();
+                }
+            }
+            match action {
+                SettingsAction::Tts(on) => {
+                    self.state.tts_enabled = on;
+                    if on {
+                        if let Err(e) = self.speech.start() {
+                            self.speech.status = format!("语音不可用：{e}");
+                        }
+                    } else {
+                        self.speech.shutdown();
+                    }
+                }
+                SettingsAction::TestSpeech => {
+                    self.say("需要确认一下：你说的是访问令牌，还是刷新令牌？");
+                }
+                SettingsAction::RestartSpeech => {
+                    self.speech.shutdown();
+                    if self.state.tts_enabled
+                        && let Err(e) = self.speech.start()
+                    {
+                        self.speech.status = format!("语音不可用：{e}");
+                    }
+                }
+                SettingsAction::CancelClarification => self.cancel_clarification(),
+                SettingsAction::Ai(mut config) => {
+                    if config.api_key != self.state.ai.api_key
+                        || config.endpoint != self.state.ai.endpoint
+                    {
+                        match crate::credentials::protect(&config.api_key, &config.endpoint) {
+                            Ok(encrypted) => config.protected_key = encrypted,
+                            Err(error) => {
+                                if let Ok(mut view) = self.settings_view.lock() {
+                                    view.ai = self.state.ai.clone();
+                                    view.ai_status = format!("保存密钥失败：{error}");
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        config
+                            .protected_key
+                            .clone_from(&self.state.ai.protected_key);
+                    }
+                    self.state.ai = config;
+                }
+                SettingsAction::HoldKey(key) => self.state.hold_key = key,
+                SettingsAction::AutoPaste(on) => self.set_auto_paste(on),
+                SettingsAction::Mode(mode) => self.set_mode(mode),
+                SettingsAction::Online(online) => {
+                    self.state.model_provider = if online {
+                        ModelProvider::OnlineQwen
+                    } else {
+                        ModelProvider::Local
+                    };
+                    self.model_ready = false;
+                }
+                SettingsAction::LocalDir(dir) => {
+                    self.state.local_model_dir = dir;
+                    self.model_ready = false;
+                }
+                SettingsAction::QwenKey(key) => {
+                    if let Ok(mut view) = self.settings_view.lock() {
+                        view.qwen_key.clone_from(&key);
+                    }
+                    self.state.qwen_api_key = key;
+                    self.model_ready = false;
+                }
+                SettingsAction::QwenModel(model) => {
+                    self.state.qwen_model = model;
+                    self.model_ready = false;
+                }
+                SettingsAction::QwenUrl(url) => {
+                    if !crate::qwen_asr::same_credential_origin(&self.state.qwen_url, &url) {
+                        self.state.qwen_api_key.clear();
+                        if let Ok(mut view) = self.settings_view.lock() {
+                            view.qwen_key.clear();
+                        }
+                    }
+                    self.state.qwen_url = url;
+                    self.model_ready = false;
+                }
+                SettingsAction::Check => self.start_health_check(true),
+                SettingsAction::Close => {
+                    self.settings_open = false;
+                    if !self.model_ready && self.health_pending.is_none() {
+                        self.start_health_check(false);
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist(&mut self) {
+        self.persist_with(config::save);
+    }
+
+    fn persist_with(&mut self, save: impl FnOnce(&serde_json::Value) -> anyhow::Result<()>) {
+        if self
+            .retry_save_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+        let snapshot = config::snapshot(&self.state);
+        if snapshot == self.saved_config && self.retry_save_at.is_none() {
+            return;
+        }
+        if snapshot != self.saved_config
+            && let Err(error) = save(&snapshot)
+        {
+            self.retry_save_at = Some(Instant::now() + Duration::from_secs(5));
+            if let Ok(mut view) = self.settings_view.lock() {
+                view.save_warning = Some(format!("设置仅在本次运行生效，将重试保存。{error}"));
+            }
+            return;
+        }
+        self.retry_save_at = None;
+        self.saved_config = snapshot;
+        if let Ok(mut view) = self.settings_view.lock() {
+            view.save_warning = None;
+        }
+    }
+
+    fn elapsed_label(&self) -> String {
+        let secs = self
+            .recording_started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0);
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+
+    /// Pick a window size for the current state and resize once when it changes.
+    fn sync_geometry(&mut self, ctx: &Context) {
+        let (w, h) = match &self.phase {
+            Phase::Idle => (DOT_SIZE, DOT_SIZE),
+            Phase::Done { .. } | Phase::Awaiting => {
+                let wrap = CARD_W - CARD_PAD * 2.0;
+                let shown = fit_result(ctx, &self.result_text, wrap, CARD_MAX_H);
+                let height = card_height(ctx, &shown, wrap).min(CARD_MAX_H);
+                self.result_shown = shown;
+                (CARD_W, height)
+            }
+            _ => (BAR_SIZE[0], BAR_SIZE[1]),
+        };
+        let size_changed =
+            (self.geometry[0] - w).abs() >= 0.5 || (self.geometry[1] - h).abs() >= 0.5;
+        let now = Instant::now();
+        if !size_changed && now < self.next_peer_check {
+            return;
+        }
+        self.next_peer_check = now + Duration::from_millis(500);
+        let peer_rect = voice_lite_rect();
+        if !size_changed && self.peer_rect == peer_rect {
+            return;
+        }
+        self.peer_rect = peer_rect;
+        self.geometry = [w, h];
+        resize_bar(ctx.pixels_per_point(), w, h, peer_rect);
+        ctx.request_repaint();
+    }
+
+    fn paint(&self, ctx: &Context) {
+        let [width, height] = self.geometry;
+        let key = holdkey::label(&self.state.hold_key).to_string();
+        let phase = &self.phase;
+        let elapsed = self.elapsed_label();
+        let shown = self.result_shown.clone();
+        let note = self.paste_note.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                let painter = ui.painter();
+                let rect = Rect::from_min_size(Pos2::ZERO, vec2(width, height));
+                match phase {
+                    Phase::Idle => paint_dot(painter, rect),
+                    Phase::Done { level, .. } => paint_card(
+                        painter,
+                        rect,
+                        *level != FeedbackLevel::Error,
+                        *level == FeedbackLevel::Warning,
+                        if self.state.input_mode == InputMode::DesktopAssistant {
+                            match level {
+                                FeedbackLevel::Success => "桌面助手",
+                                FeedbackLevel::Warning => "请核对",
+                                FeedbackLevel::Error => "操作未完成",
+                            }
+                        } else if *level == FeedbackLevel::Success { "已识别" } else { "识别失败" },
+                        &shown,
+                        &self.result_text,
+                        note.as_deref(),
+                    ),
+                    Phase::Awaiting if self.choosing_mode => paint_card(
+                        painter,
+                        rect,
+                        true,
+                        true,
+                        "选择输入模式",
+                        &shown,
+                        &self.result_text,
+                        note.as_deref(),
+                    ),
+                    Phase::Awaiting => paint_card(
+                        painter,
+                        rect,
+                        true,
+                        true,
+                            &match self.state.clarification.as_ref().map(|c| &c.question) {
+                                Some(crate::ai::FollowUp::Ready) => {
+                                    format!("可以整理   ·   按住 {key} 补充")
+                                }
+                                Some(
+                                    crate::ai::FollowUp::Deferred | crate::ai::FollowUp::Supplement,
+                                ) => format!("需求问答   ·   按住 {key} 补充"),
+                                _ => format!("需要确认   ·   按住 {key} 回答"),
+                            },
+                        &shown,
+                        &self.result_text,
+                        note.as_deref(),
+                    ),
+                    Phase::Recording => paint_pill(
+                        painter,
+                        rect,
+                        PillState::Recording {
+                            level: recording_level(),
+                            elapsed: &elapsed,
+                            hint: &format!("松开 {key} 结束并识别"),
+                        },
+                    ),
+                    Phase::Processing => paint_pill(
+                        painter,
+                        rect,
+                        PillState::Processing {
+                            time: ctx.input(|i| i.time) as f32,
+                            submitted: self.active_task.as_ref().is_some_and(|t| t.search_submitted.get().is_some()),
+                        },
+                    ),
+                }
+            });
+    }
+}
+
+enum PillState<'a> {
+    Recording {
+        level: f32,
+        elapsed: &'a str,
+        hint: &'a str,
+    },
+    Processing {
+        time: f32,
+        submitted: bool,
+    },
+}
+
+fn paint_dot(painter: &egui::Painter, rect: Rect) {
+    painter.circle_filled(
+        rect.center(),
+        5.0,
+        Color32::from_rgba_unmultiplied(150, 155, 166, 120),
+    );
+}
+
+fn paint_pill(painter: &egui::Painter, rect: Rect, state: PillState<'_>) {
+    let radius = rect.height() / 2.0;
+    // Soft drop shadow, then the capsule itself.
+    painter.rect_filled(
+        rect.translate(vec2(0.0, 3.0)),
+        radius,
+        Color32::from_black_alpha(70),
+    );
+    painter.rect_filled(rect.shrink(1.0), radius - 1.0, SURFACE);
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        radius - 1.0,
+        Stroke::new(1.0_f32, BORDER),
+        StrokeKind::Inside,
+    );
+
+    let at = |x: f32, y: f32| Pos2::new(rect.left() + x, rect.top() + y);
+
+    match state {
+        PillState::Recording {
+            level,
+            elapsed,
+            hint,
+        } => {
+            let level = level.clamp(0.0, 1.0);
+            for (index, weight) in [0.35_f32, 0.65, 1.0, 0.8, 0.5].iter().enumerate() {
+                let bar = 4.0 + 24.0 * level * weight;
+                painter.rect_filled(
+                    Rect::from_center_size(at(30.0 + index as f32 * 9.0, 32.0), vec2(4.0, bar)),
+                    2,
+                    RECORDING,
+                );
+            }
+            painter.text(
+                at(86.0, 23.0),
+                Align2::LEFT_CENTER,
+                "正在听…",
+                FontId::proportional(15.0),
+                TEXT,
+            );
+            painter.text(
+                at(rect.width() - 22.0, 23.0),
+                Align2::RIGHT_CENTER,
+                elapsed,
+                FontId::monospace(14.0),
+                MUTED,
+            );
+            painter.text(
+                at(86.0, 43.0),
+                Align2::LEFT_CENTER,
+                hint,
+                FontId::proportional(11.0),
+                MUTED,
+            );
+        }
+        PillState::Processing { time, submitted } => {
+            for index in 0..3 {
+                let pulse = ((time * 3.0) - index as f32 * 0.6).sin() * 0.5 + 0.5;
+                painter.circle_filled(at(30.0 + index as f32 * 9.0, 32.0), 2.0 + 1.8 * pulse, DONE);
+            }
+            painter.text(
+                at(86.0, 23.0),
+                Align2::LEFT_CENTER,
+                if submitted { "已提交搜索" } else { "处理中…" },
+                FontId::proportional(15.0),
+                TEXT,
+            );
+            painter.text(
+                at(86.0, 43.0),
+                Align2::LEFT_CENTER,
+                if submitted { "正在核对 Steam 结果页" } else { "松开后就交给本地模型" },
+                FontId::proportional(11.0),
+                MUTED,
+            );
+        }
+    }
+}
+
+fn question_footer(c: &crate::ai::Clarification) -> &'static str {
+    match (c.mode, &c.question) {
+        (InputMode::Interview, crate::ai::FollowUp::Question(_)) => {
+            "“这个先待定”跳过 · “先整理到这里”结束 · Esc 取消"
+        }
+        (InputMode::Interview, _) => "说“先整理到这里”生成总结 · Esc 取消",
+        _ => "回答后继续整理 · Esc 取消",
+    }
+}
+
+fn paint_card(
+    painter: &egui::Painter,
+    rect: Rect,
+    ok: bool,
+    waiting: bool,
+    title: &str,
+    text: &str,
+    full_text: &str,
+    note: Option<&str>,
+) {
+    let radius = 18.0;
+    painter.rect_filled(
+        rect.translate(vec2(0.0, 4.0)),
+        radius,
+        Color32::from_black_alpha(80),
+    );
+    painter.rect_filled(rect.shrink(1.0), radius - 1.0, SURFACE);
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        radius - 1.0,
+        Stroke::new(1.0_f32, BORDER),
+        StrokeKind::Inside,
+    );
+
+    let color = if waiting {
+        Color32::from_rgb(250, 198, 108)
+    } else if ok {
+        DONE
+    } else {
+        ERROR
+    };
+    let left = rect.left() + CARD_PAD;
+    let top = rect.top();
+
+    if waiting {
+        let center = Pos2::new(left + 6.0, top + 23.0);
+        painter.circle_stroke(center, 7.0, Stroke::new(1.4_f32, color));
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            "?",
+            FontId::proportional(11.0),
+            color,
+        );
+    } else if ok {
+        painter.add(egui::Shape::line(
+            vec![
+                Pos2::new(left, top + 24.0),
+                Pos2::new(left + 4.0, top + 28.0),
+                Pos2::new(left + 11.0, top + 18.0),
+            ],
+            Stroke::new(2.0_f32, color),
+        ));
+    } else {
+        painter.text(
+            Pos2::new(left + 4.0, top + 24.0),
+            Align2::LEFT_CENTER,
+            "!",
+            FontId::proportional(16.0),
+            color,
+        );
+    }
+    painter.text(
+        Pos2::new(left + 22.0, top + 23.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(12.0),
+        color,
+    );
+    painter.text(
+        Pos2::new(rect.right() - CARD_PAD, top + 23.0),
+        Align2::RIGHT_CENTER,
+        if text == full_text {
+            format!("{} 字", full_text.chars().count())
+        } else {
+            format!("仅预览 · 共 {} 字", full_text.chars().count())
+        },
+        FontId::proportional(11.0),
+        MUTED,
+    );
+
+    let wrap = rect.width() - CARD_PAD * 2.0;
+    let galley = painter.layout(
+        text.to_owned(),
+        FontId::proportional(RESULT_FONT),
+        if ok { TEXT } else { ERROR },
+        wrap,
+    );
+    painter.galley(Pos2::new(left, top + 46.0), galley, TEXT);
+
+    let hint = if ok {
+        note.unwrap_or("结果已保留")
+    } else {
+        "稍后自动收起"
+    };
+    painter.text(
+        Pos2::new(left, rect.bottom() - 17.0),
+        Align2::LEFT_CENTER,
+        hint,
+        FontId::proportional(11.0),
+        MUTED,
+    );
+}
+
+/// Height of the result card for text that already fits.
+fn card_height(ctx: &Context, text: &str, wrap: f32) -> f32 {
+    let galley = ctx.fonts(|fonts| {
+        fonts.layout(
+            text.to_owned(),
+            FontId::proportional(RESULT_FONT),
+            TEXT,
+            wrap,
+        )
+    });
+    (46.0 + galley.size().y + 30.0).max(CARD_MIN_H)
+}
+
+/// Cut the transcript down until it fits the tallest card, keeping an ellipsis.
+fn fit_result(ctx: &Context, text: &str, wrap: f32, max_height: f32) -> String {
+    let clipped = truncate(text, RESULT_CHARS);
+    if card_height(ctx, &clipped, wrap) <= max_height {
+        return clipped;
+    }
+    let total = clipped.chars().count();
+    let mut low = 0usize;
+    let mut high = total;
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        if card_height(ctx, &truncate(&clipped, mid), wrap) <= max_height {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    truncate(&clipped, low)
+}
+
+pub fn truncate(text: &str, max_chars: usize) -> String {
+    let mut output: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
+}
+
+fn voice_lite_rect() -> Option<[i32; 4]> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowRect, IsIconic, IsWindowVisible,
+    };
+    let title: Vec<u16> = "Vibe Voice Lite\0".encode_utf16().collect();
+    unsafe {
+        let peer = FindWindowW(std::ptr::null(), title.as_ptr());
+        if peer.is_null() || IsIconic(peer) != 0 || IsWindowVisible(peer) == 0 {
+            return None;
+        }
+        let mut rect = std::mem::zeroed();
+        (GetWindowRect(peer, &mut rect) != 0).then_some([
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        ])
+    }
+}
+
+/// Use the original bar's position only when the two rectangles overlap.
+fn avoid_peer(
+    origin: [i32; 2],
+    size: [i32; 2],
+    area: [i32; 4],
+    peer: Option<[i32; 4]>,
+    gap: i32,
+) -> [i32; 2] {
+    let [x, y] = origin;
+    let [w, h] = size;
+    let Some([left, top, right, bottom]) = peer else {
+        return origin;
+    };
+    if x >= right || x + w <= left || y >= bottom || y + h <= top {
+        return origin;
+    }
+    if right + gap + w <= area[2] {
+        [right + gap, y]
+    } else if left - gap - w >= area[0] {
+        [left - gap - w, y]
+    } else {
+        [x, (top - gap - h).max(area[1])]
+    }
+}
+
+fn resize_bar(scale: f32, width_pts: f32, height_pts: f32, peer: Option<[i32; 4]>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
+    };
+    let hwnd = own_window();
+    if hwnd == 0 {
+        return;
+    }
+    let Some((left, top, right, bottom)) = work_area_physical() else {
+        return;
+    };
+    let scale = scale.max(0.5);
+    let width = (width_pts * scale).round().max(1.0) as i32;
+    let height = (height_pts * scale).round().max(1.0) as i32;
+    let x = (left + right) / 2.0 - width as f32 / 2.0;
+    let y = bottom - 24.0 * scale - height as f32;
+    let [x, y] = avoid_peer(
+        [x.round() as i32, y.round() as i32],
+        [width, height],
+        [left as i32, top as i32, right as i32, bottom as i32],
+        peer,
+        (6.0 * scale).ceil() as i32,
+    );
+    unsafe {
+        // Clicking a question card must not take the editor's keyboard focus.
+        let style = GetWindowLongPtrW(hwnd as _, GWL_EXSTYLE);
+        if style & WS_EX_NOACTIVATE as isize == 0 {
+            SetWindowLongPtrW(hwnd as _, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+        }
+        SetWindowPos(
+            hwnd as _,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+fn work_area_physical() -> Option<(f32, f32, f32, f32)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    unsafe {
+        let mut cursor = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut cursor) == 0 {
+            return None;
+        }
+        let monitor = MonitorFromPoint(
+            POINT {
+                x: cursor.x,
+                y: cursor.y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        Some((
+            info.rcWork.left as f32,
+            info.rcWork.top as f32,
+            info.rcWork.right as f32,
+            info.rcWork.bottom as f32,
+        ))
+    }
+}
+
+/// Handle of our own top-level bar window, found by process id and title.
+fn own_window() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    };
+
+    static HANDLE: AtomicIsize = AtomicIsize::new(0);
+    let cached = HANDLE.load(Ordering::Relaxed);
+    let mut owner = 0;
+    if cached != 0 && unsafe { IsWindow(cached as _) } != 0 {
+        unsafe {
+            GetWindowThreadProcessId(cached as _, &mut owner);
+        }
+    }
+    if owner == std::process::id() {
+        return cached;
+    }
+    HANDLE.store(0, Ordering::Relaxed);
+
+    unsafe extern "system" fn callback(hwnd: *mut core::ffi::c_void, _param: isize) -> i32 {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if pid == std::process::id() {
+            let mut buffer = [0u16; 64];
+            let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+            if len > 0 {
+                let title = String::from_utf16_lossy(&buffer[..len as usize]);
+                if title == WINDOW_TITLE {
+                    HANDLE.store(hwnd as isize, Ordering::Relaxed);
+                    return 0;
+                }
+            }
+        }
+        1
+    }
+
+    unsafe {
+        EnumWindows(Some(callback), 0);
+    }
+    HANDLE.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_bar_keeps_voice_lite_visible_on_the_same_monitor() {
+        let area = [0, 0, 1920, 1080];
+        let dot = [940, 1010];
+        let size = [40, 40];
+        assert_eq!(avoid_peer(dot, size, area, None, 6), dot);
+        assert_eq!(
+            avoid_peer(dot, size, area, Some([940, 1010, 980, 1050]), 6),
+            [986, 1010]
+        );
+        assert_eq!(
+            avoid_peer(dot, size, area, Some([-980, 1010, -940, 1050]), 6),
+            dot
+        );
+        assert_eq!(
+            avoid_peer(dot, size, area, Some([0, 980, 1920, 1050]), 6),
+            [940, 934]
+        );
+    }
+
+    #[test]
+    fn fourth_mode_displays_the_action_receipt() {
+        let mut app = test_app();
+        app.set_mode(InputMode::DesktopAssistant);
+        let mut result = question_result();
+        result.ai_note = Some("桌面助手".into());
+        result.clarification = None;
+        result.review_required = false;
+        result.raw_text = Some("打开计算器".into());
+        result.delivered_text = Some("已打开计算器。".into());
+        result.auto_paste = true;
+        app.accept_finish_result(result);
+        assert_eq!(app.result_text, "已打开计算器。");
+        assert_eq!(app.paste_note.as_deref(), Some("桌面助手"));
+    }
+
+    #[test]
+    fn send_receipts_keep_their_level_and_copy_on_the_finished_card() {
+        let mut app = test_app();
+        app.set_mode(InputMode::DesktopAssistant);
+        for (level, text) in [
+            (FeedbackLevel::Success, "已发送。"),
+            (FeedbackLevel::Warning, "已按回车，无法确认是否发出，请查看聊天记录。"),
+            (FeedbackLevel::Error, "发送过程出错，结果未知，请先查看对话。"),
+        ] {
+            let mut result = question_result();
+            result.feedback_level = Some(level);
+            result.clarification = None;
+            result.review_required = false;
+            result.ai_note = Some("桌面助手".into());
+            result.input_state = if level == FeedbackLevel::Error { InputState::Error } else { InputState::Success };
+            result.status_message = text.into();
+            result.delivered_text = Some(text.into());
+            app.accept_finish_result(result);
+            assert!(matches!(app.phase, Phase::Done { level: shown, .. } if shown == level));
+            assert_eq!(app.result_text, text);
+        }
+    }
+
+    fn test_app() -> std::mem::ManuallyDrop<VoiceLiteApp> {
+        let state = NativeAppState {
+            tts_enabled: false,
+            input_mode: InputMode::DirectPrompt,
+            ..Default::default()
+        };
+        let (settings_tx, settings_rx) = mpsc::channel();
+        std::mem::ManuallyDrop::new(VoiceLiteApp {
+            speech: crate::speech::SpeechOutput::default(),
+            ctx: Context::default(),
+            settings_view: Arc::new(Mutex::new(SettingsView::from_state(&state))),
+            saved_config: config::snapshot(&state),
+            state,
+            phase: Phase::Idle,
+            recording_started_at: None,
+            pending: None,
+            choosing_mode: false,
+            esc_down: false,
+            active_task: None,
+            health_pending: None,
+            model_ready: true,
+            tray: None,
+            settings_open: false,
+            settings_tx,
+            settings_rx,
+            result_text: String::new(),
+            result_shown: String::new(),
+            paste_note: None,
+            retry_save_at: None,
+            last_down: false,
+            started_at: Instant::now(),
+            placed: false,
+            peer_rect: None,
+            next_peer_check: Instant::now(),
+            geometry: [0.0, 0.0],
+        })
+    }
+
+    #[test]
+    fn voice_picker_preserves_the_interview_until_a_different_mode_is_chosen() {
+        let mut app = test_app();
+        app.set_mode(InputMode::CodeEdit);
+        app.accept_finish_result(question_result());
+        app.state.last_final_result = "前一条正文".into();
+        let original = app.state.clarification.as_ref().unwrap().original.clone();
+        let last_raw = app.state.raw_text.clone();
+        for action in [
+            ModeCommand::Cancel,
+            ModeCommand::Choose(InputMode::CodeEdit),
+        ] {
+            app.handle_mode_command(ModeCommand::Ask);
+            app.handle_mode_command(ModeCommand::Retry);
+            assert!(app.choosing_mode);
+            assert!(matches!(app.phase, Phase::Awaiting));
+            assert_eq!(app.result_text, voice_mode::RETRY);
+            app.handle_mode_command(action);
+            if matches!(action, ModeCommand::Choose(_)) {
+                assert_eq!(app.result_text, "当前已是开发指令。");
+            }
+            assert!(!app.choosing_mode);
+            app.restore_question();
+            assert_eq!(app.state.clarification.as_ref().unwrap().original, original);
+            assert!(matches!(app.phase, Phase::Awaiting));
+        }
+        app.handle_mode_command(ModeCommand::Ask);
+        app.handle_mode_command(ModeCommand::Choose(InputMode::Interview));
+        assert_eq!(app.result_text, "已切换到需求问答。");
+        assert_eq!(app.state.input_mode, InputMode::Interview);
+        assert!(app.state.clarification.is_none());
+        assert_eq!(
+            app.settings_view.lock().unwrap().input_mode,
+            InputMode::Interview
+        );
+        let mut reloaded = NativeAppState::default();
+        config::apply(&mut reloaded, &config::snapshot(&app.state));
+        assert_eq!(reloaded.input_mode, InputMode::Interview);
+        assert_eq!(app.state.raw_text, last_raw);
+        assert_eq!(app.state.last_final_result, "前一条正文");
+    }
+
+    #[test]
+    fn direct_choice_of_current_mode_allows_another_recording() {
+        let mut app = test_app();
+        app.state.input_state = InputState::Processing;
+        app.handle_mode_command(ModeCommand::Choose(InputMode::DirectPrompt));
+        assert_eq!(app.state.input_state, InputState::Idle);
+    }
+
+    #[test]
+    fn picker_recovers_after_asr_failure_and_tray_selection_discards_a_late_answer() {
+        let mut app = test_app();
+        app.handle_mode_command(ModeCommand::Ask);
+        app.set_error("没听清");
+        app.restore_question();
+        assert!(app.choosing_mode);
+        assert_eq!(app.result_text, voice_mode::QUESTION);
+        let (tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.set_mode(InputMode::CodeEdit);
+        assert!(!app.choosing_mode);
+        assert!(tx.send(FinishEvent::Mode(ModeCommand::Cancel)).is_err());
+        assert_eq!(app.state.input_mode, InputMode::CodeEdit);
+    }
+
+    #[test]
+    fn editing_only_the_api_key_updates_the_persisted_snapshot() {
+        let mut app = test_app();
+        let before = config::snapshot(&app.state);
+        let mut ai = app.state.ai.clone();
+        ai.api_key = "test-only-ui-secret".into();
+        app.settings_tx.send(SettingsAction::Ai(ai)).unwrap();
+        app.drain_settings();
+        assert_ne!(before, config::snapshot(&app.state));
+        assert_eq!(
+            crate::credentials::unprotect(&app.state.ai.protected_key, &app.state.ai.endpoint)
+                .unwrap(),
+            "test-only-ui-secret"
+        );
+        let mut ai = app.state.ai.clone();
+        ai.api_key.clear();
+        app.settings_tx.send(SettingsAction::Ai(ai)).unwrap();
+        app.drain_settings();
+        assert!(app.state.ai.protected_key.is_empty());
+    }
+
+    #[test]
+    fn asr_credentials_stay_with_the_same_tls_origin() {
+        let mut app = test_app();
+        let update = |app: &mut VoiceLiteApp, action| {
+            app.settings_tx.send(action).unwrap();
+            app.drain_settings();
+        };
+        update(
+            &mut app,
+            SettingsAction::QwenUrl("wss://example.org/old".into()),
+        );
+        update(&mut app, SettingsAction::QwenKey("test-only".into()));
+        update(
+            &mut app,
+            SettingsAction::QwenUrl("wss://EXAMPLE.org:443/new".into()),
+        );
+        assert_eq!(app.state.qwen_api_key, "test-only");
+        assert!(!crate::qwen_asr::same_credential_origin(
+            "wss://example.org",
+            "wss://example.org:8443"
+        ));
+        assert!(!crate::qwen_asr::same_credential_origin(
+            "wss://example.org",
+            "invalid"
+        ));
+        update(
+            &mut app,
+            SettingsAction::QwenUrl("wss://another.example.org/asr".into()),
+        );
+        assert!(app.state.qwen_api_key.is_empty());
+        assert!(app.settings_view.lock().unwrap().qwen_key.is_empty());
+    }
+
+    #[test]
+    fn disabling_auto_paste_while_processing_suppresses_delivery() {
+        let mut app = test_app();
+        let mut result = question_result();
+        result.auto_paste = true;
+        result.clarification = None;
+        result.review_required = false;
+        result.ai_note = None;
+        // An empty final result makes unexpected delivery fail without touching the clipboard.
+        result.delivered_text = None;
+        app.set_auto_paste(false);
+        app.accept_finish_result(result);
+        assert_eq!(app.paste_note.as_deref(), Some("自动粘贴已关闭"));
+    }
+
+    #[test]
+    fn first_ai_failure_points_to_the_recoverable_transcript() {
+        let mut app = test_app();
+        app.set_mode(InputMode::CodeEdit);
+        let mut result = question_result();
+        result.clarification = None;
+        result.ai_note = Some("AI 整理失败，网络不可用".into());
+        result.delivered_text = result.raw_text.clone();
+        app.accept_finish_result(result);
+        assert!(app.result_text.contains("复制原文"));
+        assert!(!app.result_text.contains("Esc"));
+        assert_eq!(app.settings_view.lock().unwrap().raw_text, "原始要求");
+    }
+
+    #[test]
+    fn changing_the_glossary_after_the_key_keeps_the_restart_credential() {
+        let mut app = test_app();
+        let mut form = app.state.ai.clone();
+        form.api_key = "test-only-replacement".into();
+        app.settings_tx
+            .send(SettingsAction::Ai(form.clone()))
+            .unwrap();
+        app.drain_settings();
+        form.glossary = "刷新令牌".into();
+        app.settings_tx.send(SettingsAction::Ai(form)).unwrap();
+        app.drain_settings();
+        let mut restored = NativeAppState::default();
+        config::apply(&mut restored, &config::snapshot(&app.state));
+        assert_eq!(
+            crate::credentials::unprotect(&restored.ai.protected_key, &restored.ai.endpoint)
+                .unwrap(),
+            "test-only-replacement"
+        );
+    }
+
+    #[test]
+    fn write_failure_keeps_recording_and_retries_latest_settings() {
+        let mut app = test_app();
+        app.state.auto_paste = !app.state.auto_paste;
+        app.phase = Phase::Recording;
+        app.state.input_state = InputState::Recording;
+        app.persist_with(|_| anyhow::bail!("outside test directory"));
+        assert!(matches!(app.phase, Phase::Recording));
+        assert_eq!(app.state.input_state, InputState::Recording);
+        app.open_settings();
+        assert!(app.settings_view.lock().unwrap().save_warning.is_some());
+        app.persist_with(|_| panic!("must back off"));
+        app.state.hold_key = "F9".into();
+        app.retry_save_at = Some(Instant::now());
+        app.persist_with(|snapshot| {
+            assert_eq!(snapshot["hold_key"], "F9");
+            Ok(())
+        });
+        assert_eq!(app.saved_config, config::snapshot(&app.state));
+        assert!(app.settings_view.lock().unwrap().save_warning.is_none());
+    }
+
+    #[test]
+    fn short_answer_restores_question_and_can_be_cancelled() {
+        let mut app = test_app();
+        app.accept_finish_result(question_result());
+        app.phase = Phase::Recording;
+        app.recording_started_at = Some(Instant::now());
+        app.stop_recording();
+        let Phase::Done { until, .. } = &mut app.phase else {
+            panic!("missing short press feedback")
+        };
+        *until = Instant::now();
+        app.expire_phase();
+        assert!(matches!(app.phase, Phase::Awaiting));
+        assert_eq!(app.result_text, "访问令牌还是刷新令牌？");
+        app.cancel_clarification();
+        assert!(app.state.clarification.is_none());
+    }
+
+    #[test]
+    fn recording_error_clears_busy_state_and_stale_delivery_note() {
+        let mut app = test_app();
+        app.state.input_state = InputState::Recording;
+        app.recording_started_at = Some(Instant::now());
+        app.paste_note = Some("old delivery failure".into());
+        app.set_error("microphone disconnected");
+        assert_eq!(app.state.input_state, InputState::Error);
+        assert!(app.recording_started_at.is_none());
+        assert!(app.paste_note.is_none());
+    }
+
+    #[test]
+    fn reopening_settings_keeps_device_and_recognition_results() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.health_pending = Some(rx);
+        tx.send((true, "model ready".into(), "detected microphone".into()))
+            .unwrap();
+        app.poll_health();
+        app.open_settings();
+        let view = app.settings_view.lock().unwrap();
+        assert_eq!(view.status, "model ready");
+        assert_eq!(view.microphone, "detected microphone");
+        assert!(!view.checking);
+    }
+
+    #[test]
+    fn model_change_discards_in_flight_readiness_result() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.health_pending = Some(rx);
+        tx.send((true, "old model ready".into(), "mic".into()))
+            .unwrap();
+        app.settings_tx.send(SettingsAction::Online(true)).unwrap();
+        app.drain_settings();
+        app.poll_health();
+        assert!(!app.model_ready);
+        assert!(app.health_pending.is_none());
+    }
+
+    #[test]
+    fn next_press_interrupts_result_card_but_held_key_does_not_restart() {
+        let mut app = test_app();
+        app.model_ready = false; // Exercise the start path without a real microphone.
+        app.phase = Phase::Done {
+            until: Instant::now() + RESULT_LINGER,
+            level: FeedbackLevel::Success,
+        };
+        app.last_down = true;
+        app.handle_hold_key(true, false);
+        assert!(!app.settings_open);
+        app.handle_hold_key(false, false);
+        app.handle_hold_key(true, false);
+        assert!(app.settings_open);
+        assert_eq!(app.state.input_state, InputState::Error);
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        assert_eq!(truncate("你好世界", 10), "你好世界");
+        assert_eq!(truncate("一二三四五", 3), "一二三…");
+        assert_eq!(truncate("", 3), "");
+    }
+    #[test]
+    fn long_preview_fits_above_the_footer_and_retains_the_original() {
+        let ctx = Context::default();
+        let full = "One line per item.\n".repeat(100);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let wrap = CARD_W - CARD_PAD * 2.0;
+            let shown = fit_result(ctx, &full, wrap, CARD_MAX_H);
+            assert!(shown.ends_with('…'));
+            assert!(shown.chars().count() < full.chars().count());
+            assert!(card_height(ctx, &shown, wrap) <= CARD_MAX_H);
+        });
+    }
+
+    fn question_result() -> FinishInputResult {
+        FinishInputResult {
+            feedback_level: None,
+            clarification: Some(crate::ai::Clarification {
+                original: "原始要求".into(),
+                question: "访问令牌还是刷新令牌？".into(),
+                mode: InputMode::CodeEdit,
+                answers: Vec::new(),
+            }),
+            review_required: true,
+            ai_note: Some("AI 需要确认".into()),
+            input_state: InputState::Success,
+            status_message: "需要确认".into(),
+            raw_text: Some("原始要求".into()),
+            delivered_text: Some("整理正文\n待确认".into()),
+            local_model_ready: true,
+            local_model_status: String::new(),
+            local_model_summary: String::new(),
+            qwen_ready: false,
+            qwen_status: String::new(),
+            last_recording_info: String::new(),
+            auto_paste: false,
+        }
+    }
+    #[test]
+    fn question_card_stays_visible_and_answer_clears_context() {
+        let mut app = test_app();
+        app.accept_finish_result(question_result());
+        assert!(matches!(app.phase, Phase::Awaiting));
+        app.expire_phase();
+        assert!(matches!(app.phase, Phase::Awaiting));
+        assert!(app.state.clarification.is_some());
+        assert_eq!(app.result_text, "访问令牌还是刷新令牌？");
+        for _ in 0..3 {
+            app.accept_finish_result(question_result());
+            app.expire_phase();
+            assert!(matches!(app.phase, Phase::Awaiting));
+            assert!(app.state.clarification.is_some());
+        }
+        let mut answer = question_result();
+        answer.clarification = None;
+        answer.review_required = false;
+        answer.ai_note = Some("AI 已整理".into());
+        app.accept_finish_result(answer);
+        assert!(app.state.clarification.is_none());
+        assert!(matches!(app.phase, Phase::Done { level: FeedbackLevel::Success, .. }));
+    }
+    #[test]
+    fn voice_cancellation_ends_questions_without_pasting() {
+        let mut app = test_app();
+        app.accept_finish_result(question_result());
+        let mut result = question_result();
+        result.clarification = None;
+        result.review_required = false;
+        result.ai_note = Some("已取消整理".into());
+        result.delivered_text = Some(String::new());
+        result.auto_paste = false;
+        app.accept_finish_result(result);
+        assert!(app.state.clarification.is_none());
+        assert!(matches!(app.phase, Phase::Done { level: FeedbackLevel::Success, .. }));
+        assert_eq!(app.result_text, "已取消本次整理");
+        assert!(app.state.delivered_text.is_empty());
+    }
+    #[test]
+    fn ai_failure_displays_retry_instead_of_repeating_old_question() {
+        let mut app = test_app();
+        let mut result = question_result();
+        result.ai_note = Some("AI 整理失败，格式无效".into());
+        assert!(services::spoken_feedback(&result).is_none());
+        app.accept_finish_result(result);
+        assert!(app.state.clarification.is_some());
+        assert!(app.result_text.contains("AI 整理失败"));
+        assert!(!app.result_text.contains("访问令牌"));
+    }
+    #[test]
+    fn cancelling_clarification_discards_inflight_answer() {
+        let mut app = test_app();
+        app.accept_finish_result(question_result());
+        let task = TaskControl::new(Duration::from_secs(10));
+        app.active_task = Some(task.clone());
+        let (tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.cancel_clarification();
+        assert!(task.check().is_err());
+        assert!(
+            tx.send(FinishEvent::Dictation(Box::new(question_result())))
+                .is_err()
+        );
+        assert!(app.state.clarification.is_none());
+        assert!(matches!(app.phase, Phase::Idle));
+    }
+    #[test]
+    fn switching_modes_cancels_interview_and_pending_answer() {
+        let mut app = test_app();
+        app.set_mode(InputMode::Interview);
+        let mut question = question_result();
+        question.clarification.as_mut().unwrap().mode = InputMode::Interview;
+        app.accept_finish_result(question);
+        assert!(app.paste_note.as_deref().unwrap().contains("先整理到这里"));
+        let task = TaskControl::new(Duration::from_secs(10));
+        app.active_task = Some(task.clone());
+        app.set_mode(InputMode::CodeEdit);
+        assert!(task.check().is_err());
+        assert!(app.state.clarification.is_none());
+        assert!(matches!(app.phase, Phase::Idle));
+    }
+}

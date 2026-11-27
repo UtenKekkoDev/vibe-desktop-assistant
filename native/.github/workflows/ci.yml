@@ -1,0 +1,76 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Audit publishable files
+        run: python scripts/audit_release.py
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Check and lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests (no microphone, GPU or API key required)
+        run: cargo test --locked --all-targets
+      - name: Python syntax
+        run: python -m compileall -q tts scripts
+      - name: Test playback device routing
+        run: python -S tts/test_audio_output.py -v
+      - name: Build and package
+        run: |
+          cargo build --locked --release --bin vibe-desktop-assistant
+          ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-ci-bundle
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  publish-preview:
+    needs: windows
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'Release preview v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-ci-bundle
+          path: dist
+      - name: Publish the tested Windows preview
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("../Cargo.toml","rb"))["package"]["version"])')
+          tag="v$version"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]+$ ]]
+          [[ "$RELEASE_MESSAGE" == "Release preview $tag" ]]
+          archive=vibe-desktop-assistant-windows-x64.zip
+          sha256sum -c "$archive.sha256"
+          unzip -tq "$archive"
+          gh release create "$tag" "$archive" "$archive.sha256" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --title "Vibe Desktop Assistant $tag" \
+            --notes-file "../docs/releases/$tag.md"
