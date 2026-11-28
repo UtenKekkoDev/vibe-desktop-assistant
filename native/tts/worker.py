@@ -30,7 +30,7 @@ def read_commands():
                     if not text or len(text)>500:
                         event('error',latest,message='播报内容为空或过长，请查看文字结果。')
                     else:
-                        pending=(latest,text,time.monotonic())
+                        pending=(latest,text,command.get('voice',''),time.monotonic())
                 condition.notify_all()
             if kind=='stop': event('stopped',latest)
     except Exception:
@@ -143,7 +143,7 @@ threading.Thread(target=read_commands,daemon=True).start()
 while True:
     with condition:
         condition.wait_for(lambda: pending is not None)
-        request,text,created=pending
+        request,text,voice,created=pending
         pending=None
         if time.monotonic()-created>30:
             event('error',request,message='播报等待过久，已跳过；文字结果仍保留。');continue
@@ -153,7 +153,8 @@ while True:
         with condition:
             if request!=latest: continue
             player.begin(request)
-        for audio,sr,info in engine.stream(text):
+        chunks = engine.stream(text, voice) if config.get('engine') == 'v5_turbo' else engine.stream(text)
+        for audio,sr,info in chunks:
             with condition:
                 if request!=latest: break
                 player.put(request,audio)

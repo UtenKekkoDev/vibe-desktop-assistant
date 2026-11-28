@@ -8,6 +8,7 @@ open_app：用户直接要求打开或切换一个具体应用。value 为原话
 fill_text：用户明确要求在当前输入框填写一段正文。value 为要写入的正文。
 fill_send：用户直接委托传话即表示发送。例如“帮我跟小陈说，我晚十分钟到”应返回 fill_send，recipient 为“小陈”，value 为“我晚十分钟到”。用户明确说草稿、先写下、别发时返回 fill_text；引用或叙述他人说过的话仍是 dictate。客户端在本机查找并核对收件人。
 当前输入框已有文字时，继续口述就追加，要求填完发送就追加后发送，无需询问是否处理已有文字。
+context.currentWeChat 为 true 表示录音开始时已核对前台微信聊天。此时没点名的“帮我发一句我到了”“在当前聊天框发送我到了”用 fill_send，正文只取“我到了”，recipient 填 null；“发送”“发出去”用 send_draft。“当前聊天”“这个聊天框”都是眼前的会话，不是联系人名。追问时用户只补充“在微信”也可沿用已核对的当前聊天和之前明确的正文。普通口述、引用、否定、只写不发仍按原意处理；明确点名时仍保留 recipient。
 send_draft：用户明确要求发出当前草稿，context 同时给出了有效草稿与目标。value 为 null。
 clarify：有操作意图但对象不明、需要未提供的上下文，或请求超出以上能力。value 为简短中文追问。
 以下附加意图仅当 context.sessionMode 为 true 时可用：
@@ -23,6 +24,10 @@ compare_budget：当 context.budgetsAvailable 为 true 时，请求比较两份�
 “写下发出去这三个字”只填写正文。“先给我看”不能解释为提交。未完成的委托可参考上下文，但不可越过用户的最终限制。
 区分说话人自己的命令、转述他人的话和否定表达。分类本身不会执行任何动作。`;
 
+const currentChatName = /^(?:当前|这个|本)(?:的)?(?:微信)?(?:聊天框|聊天窗口|聊天|会话|对话框|对话|群聊)$/u;
+const currentChatAddress = /(?:发给|发送给|给|跟|和)(?:当前|这个|本)(?:的)?(?:微信)?(?:聊天框|聊天窗口|聊天|会话|对话框|对话|群聊)(?=$|[。！？，,：:\s]|发|说)/gu;
+const openChatFirst = '请先打开要发送的微信聊天，再说一次。';
+
 export function decode(result, utterance, context) {
   const { intent, value, recipient, application } = JSON.parse(result);
   if (intent === 'open_app' && /^(?:在|用)?\s*(?:微信|wechat)(?:里面|里|上)?[。！？!?]?$/iu.test(utterance.trim())
@@ -33,13 +38,17 @@ export function decode(result, utterance, context) {
   const named = {};
   if (writing) {
     const sources = [utterance, context.clarification?.original, ...(context.clarification?.answers ?? [])].filter(Boolean);
-    if (typeof recipient === 'string' && recipient.trim() && sources.some(s => s.includes(recipient.trim()))) {
+    const currentAlias = typeof recipient === 'string' && currentChatName.test(recipient.trim());
+    if (typeof recipient === 'string' && !currentAlias && recipient.trim() && sources.some(s => s.includes(recipient.trim()))) {
       if (application && !/^(微信|wechat|weixin)$/iu.test(application)) {
         return { intent: 'clarify', value: '这个软件的联系人发送尚未适配。可以先打开应用，再用语音定位控件。' };
       }
       named.recipient = recipient.trim();
-    } else if (recipient !== null || sources.some(s => /(?:发给|发送给)(?!当前|这个聊天)|给[^，。！？]{1,24}?(?:发一句|发一条|发消息|发送)|(?:跟|和)[^，。！？]{1,24}?说/u.test(s))) {
+    } else if ((!currentAlias && recipient !== null) || sources.some(s => /发给|给[^，。！？]{1,24}?(?:发一句|发一条|发消息|发送)|(?:跟|和)[^，。！？]{1,24}?说/u.test(s.replace(currentChatAddress, '')))) {
       return { intent: 'clarify', value: '请明确收件人和要操作的内容。' };
+    } else if (!context.currentWeChat && (/^(?:微信|wechat|weixin)$/iu.test(application)
+               || sources.some(s => /^(?:请)?(?:帮我)?(?:在|用|到|往|给)微信(?:中|里|上|当前|这个|发)/u.test(s.trim())))) {
+      return { intent: 'clarify', value: openChatFirst };
     }
   }
   if (context.sessionMode) {
@@ -66,7 +75,7 @@ export function decode(result, utterance, context) {
   if (intent === 'dictate' && value === null) return { intent, text: utterance };
   if (intent === 'send_draft' && value === null) {
     if (context.draft?.trim() && context.target?.trim()) return { intent, ...named };
-    return { intent: 'clarify', value: '要把哪段内容发到哪里？' };
+    return { intent: 'clarify', value: context.currentWeChat && !named.recipient ? '当前聊天里没有草稿，你想发什么？' : '要把哪段内容发到哪里？' };
   }
   if (['open_app', 'fill_text', 'fill_send', 'clarify'].includes(intent) && typeof value === 'string' && value.trim()) {
     return { intent, value, ...named };
@@ -78,6 +87,12 @@ export async function classify(utterance, context = {}, { signal, apiKey } = {})
   if (!utterance?.trim()) throw new Error('请输入要判断的一句话。');
   if (context.sessionMode && !context.clarification) {
     const text = utterance.trim();
+    if (context.currentWeChat) {
+      if (/^(?:请|帮我)?(?:发送|发出去|发出|发送当前草稿|把(?:当前|这段)草稿发出去)[。！!]?$/u.test(text)) {
+        return context.draft ? { intent: 'send_draft', currentChat: true }
+          : { intent: 'clarify', value: '当前聊天里没有草稿，你想发什么？' };
+      }
+    }
     if (/^(?:请|帮我)?(?:去|切到|切换到|打开|在)\s*(?:Codex|ChatGPT).{0,40}(?:项目|另一个对话|那个聊天)/iu.test(text)) {
       return {intent:'clarify', value:'请先切到指定项目和对话，再说要提交的内容。'};
     }

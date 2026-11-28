@@ -23,8 +23,10 @@ class TurboStream:
 
     def __init__(self, config, base):
         self.runtime = (base / config["turbo_runtime"]).resolve()
-        self.reference = (base / config["reference_audio"]).resolve(strict=True)
-        self.prompt = config["reference_text"]
+        self.base = base
+        self.reference_dir = (base / config["reference_audio"]).resolve().parent
+        self.voices = {p["id"]: p for p in config.get("voices", [])}
+        self.default_voice = next(iter(self.voices.values()), config)
         self.children = []
 
     def start_service(self, command, env, port):
@@ -62,7 +64,7 @@ class TurboStream:
             self.port = free_port()
             self.start_service([self.runtime/"gsv/gsv_server.exe", "--models", self.runtime/"models",
                                 "--device", "vulkan", "--host", "127.0.0.1", "--port", str(self.port),
-                                "--sidecar", f"127.0.0.1:{side}", "--allow-path", self.reference.parent],
+                                "--sidecar", f"127.0.0.1:{side}", "--allow-path", self.reference_dir],
                                env, self.port)
         except Exception:
             self.close()
@@ -75,10 +77,15 @@ class TurboStream:
             child.wait()
         self.children.clear()
 
-    def stream(self, text):
+    def stream(self, text, voice=""):
+        profile = self.voices[voice] if voice else self.default_voice
+        reference = (self.base / profile["reference_audio"]).resolve(strict=True)
+        if not reference.is_relative_to(self.reference_dir):
+            raise ValueError("Voice reference is outside the configured reference folder")
+        prompt_lang = {"zh": "all_zh", "ja": "all_ja"}[profile.get("reference_language", "zh")]
         lang = "auto" if any(c.isascii() and c.isalpha() for c in text) else "zh"
-        body = dict(text=text, text_lang=lang, prompt_lang="all_zh", prompt_text=self.prompt,
-                    ref_audio_path=str(self.reference), sample_steps=4, stream=True, seed=42, media_type="wav")
+        body = dict(text=text, text_lang=lang, prompt_lang=prompt_lang, prompt_text=profile["reference_text"],
+                    ref_audio_path=str(reference), sample_steps=4, stream=True, seed=42, media_type="wav")
         with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=75)) as conn:
             conn.request("POST", "/tts", json.dumps(body).encode(), {"Content-Type": "application/json"})
             response = conn.getresponse()

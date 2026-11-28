@@ -7,6 +7,7 @@ mod credentials;
 mod holdkey;
 mod icons;
 mod latency;
+mod processing_motion;
 mod qwen_asr;
 mod sensevoice;
 mod services;
@@ -18,6 +19,7 @@ mod task;
 mod tray;
 mod ui;
 mod voice_mode;
+mod wake;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, WindowLevel};
 use std::fs;

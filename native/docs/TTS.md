@@ -7,7 +7,7 @@ Extract the [tested Windows package](https://huggingface.co/KakaruHayate/GSV.CPP
 and point `turbo_runtime` at the directory containing `gsv/`, `models/`, `frontend/` and `python/`.
 The tested ZIP has SHA-256 `852eaceb994d7e7422c62cb8153e80f19b2d759382e744d98ba186b3f16fccab`.
 Install `numpy` and `sounddevice` in the worker's Python environment.
-Place a reference WAV in its own folder and set its exact Chinese transcript in `tts/runtime.json`.
+Place a reference WAV in its own folder and set its exact transcript in `tts/runtime.json`.
 Paths in this example are relative to that file.
 
 ```json
@@ -19,6 +19,12 @@ Paths in this example are relative to that file.
   "reference_text": "你好，今天有什么需要我帮忙的？"
 }
 ```
+
+To show a voice selector in Settings, add a `voices` array to this configuration.
+Each entry has a stable `id`, display `label`, `reference_audio`, `reference_text`,
+and `reference_language` (`zh` or `ja`). Keep the WAVs in the configured reference
+folder. The first entry is the initial voice. The assistant remembers the selected
+ID and uses its reference for previews and spoken replies.
 
 Open the voice settings and select the preview button to test playback.
 In desktop mode, send receipts use the same wording on screen and in speech.

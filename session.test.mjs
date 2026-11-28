@@ -2,6 +2,68 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Session } from './session.mjs';
 import { classify, decode } from './intent.mjs';
+import { createAssistant } from './assistant.mjs';
+
+test('foreground WeChat routes current-chat messages and draft sends without contact search', async () => {
+  const editor = { identity:'wx/1', hwnd:7, target:'微信', recipient:'本地测试对象', isWeChat:true,
+    isForeground:true, sendAvailable:true, draft:'' };
+  const actions = [];
+  const session = createAssistant({}, {
+    decide: async (text, ctx) => {
+      assert.equal(ctx.currentWeChat,true);
+      assert.ok(!JSON.stringify(ctx).includes(editor.recipient));
+      if (text === '发送') return classify(text,ctx);
+      return decode(JSON.stringify({intent:'fill_send',value:'我到了',recipient:'当前聊天框'}),text,ctx);
+    },
+    desktop: async req => {
+      if (req.op === 'capture') return {...editor};
+      assert.equal(req.op,'apply');
+      assert.equal(req.binding.identity,editor.identity);
+      actions.push(req.decision.intent);
+      if (req.decision.intent === 'set_draft') {
+        editor.draft = req.decision.value;
+        return {status:'written',draft:editor.draft};
+      }
+      assert.equal(req.decision.intent,'send_draft');
+      editor.draft = '';
+      return {status:'confirmed'};
+    },
+  });
+  const start = await session.captureAtStart({foregroundHwnd:7});
+  assert.equal((await session.handle('给当前聊天框发一句我到了',{initialBinding:start})).status,'confirmed');
+  Object.assign(editor,{identity:'wx/2',draft:'第二个聊天的草稿'});
+  assert.equal((await session.handle('发送')).status,'confirmed');
+  assert.equal((await session.handle('发送')).status,'clarify');
+  session.clearClarification();
+  editor.draft = '待发';
+  const old = await session.captureAtStart({foregroundHwnd:7});
+  editor.identity = 'wx/3';
+  assert.equal((await session.handle('发送',{initialBinding:old})).status,'target_changed');
+  assert.deepEqual(actions,['set_draft','send_draft','send_draft']);
+});
+
+test('a missing WeChat conversation never redirects a send to another editor', async () => {
+  const response = JSON.stringify({intent:'fill_send',value:'我到了',recipient:null,application:'微信'});
+  assert.equal(decode(response,'在微信里发一句我到了',{target:'记事本'}).intent,'clarify');
+  const {session,editor,writes,count} = fixture();
+  Object.assign(editor,{isWeChat:true,isForeground:true,sendAvailable:false});
+  assert.equal((await session.handle('边写边发')).status,'clarify');
+  assert.deepEqual(writes,[]);
+  assert.equal(count(),0);
+});
+
+test('a WeChat clarification cannot move an unnamed message into a different chat', async () => {
+  const {session,editor,writes,count} = fixture({
+    decide: async (text,ctx) => ctx.clarification ? {intent:'fill_send',value:'我到了'}
+      : {intent:'clarify',value:'你想在哪里发送？'},
+  });
+  Object.assign(editor,{isWeChat:true,isForeground:true,sendAvailable:true,recipient:'甲'});
+  assert.equal((await session.handle('帮我发我到了')).status,'clarify');
+  Object.assign(editor,{identity:'另一个聊天',recipient:'乙'});
+  assert.equal((await session.handle('在微信')).status,'target_changed');
+  assert.equal(count(),0);
+  assert.deepEqual(writes,[]);
+});
 
 test('current AI questions submit, draft requests stay drafts, and a missing AI target asks', async () => {
   const ctx = {sessionMode:true,chatApp:'Codex'};

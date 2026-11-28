@@ -202,7 +202,7 @@ def capture(target=None, field=None, send_button=None):
     editor.check(editor.original)
     return {"identity": identity, "target": editor.title, "draft": editor.original, "hwnd": editor.hwnd,
             "recipient": key[1] if isinstance(key, list) and key[0] == "weixin" else None,
-            "chatApp": editor.chat_app,
+            "chatApp": editor.chat_app, "isWeChat": is_weixin_main(uia.ControlFromHandle(editor.hwnd)),
             "isForeground": win32gui.GetForegroundWindow() == editor.hwnd,
             "field": field, "sendButton": send_button, "foreground": not bool(target),
             "sendAvailable": key is not None}

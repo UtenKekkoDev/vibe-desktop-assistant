@@ -43,7 +43,7 @@ pub fn cancel_recording() {
 pub fn recording_level() -> f32 {
     f32::from_bits(LEVEL.load(Ordering::Relaxed))
 }
-fn default_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+pub(crate) fn default_input() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let device = cpal::default_host()
         .default_input_device()
         .context("没有找到可用的默认麦克风。")?;
@@ -82,6 +82,7 @@ pub fn start_recording() -> Result<String> {
     if guard.is_some() {
         return Err(anyhow!("当前已经在录音中。"));
     }
+    LEVEL.store(0, Ordering::Relaxed);
 
     let (device, supported_config) = default_input()?;
     let device_name = device.name().unwrap_or_else(|_| "未知设备".to_string());

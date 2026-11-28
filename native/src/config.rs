@@ -35,11 +35,15 @@ pub fn snapshot(s: &NativeAppState) -> Value {
         "qwen_url":s.qwen_url, "qwen_language":s.qwen_language,
         "ai_enabled":s.ai.enabled, "ai_provider":s.ai.provider, "ai_endpoint":s.ai.endpoint,
         "ai_model":s.ai.model, "ai_glossary":s.ai.glossary,
-        "ai_key_protected":s.ai.protected_key, "tts_enabled":s.tts_enabled})
+        "ai_key_protected":s.ai.protected_key, "tts_enabled":s.tts_enabled, "tts_voice":s.tts_voice,
+        "wake_enabled":s.wake_enabled, "wake_word":s.wake_word})
 }
 
 pub fn apply(s: &mut NativeAppState, v: &Value) {
     s.tts_enabled = v["tts_enabled"].as_bool().unwrap_or(true);
+    s.wake_enabled = v["wake_enabled"].as_bool().unwrap_or(false);
+    s.wake_word = v["wake_word"].as_str().filter(|s| crate::wake::valid_phrase(s)).unwrap_or("小助手").into();
+    s.tts_voice = v["tts_voice"].as_str().unwrap_or_default().to_owned();
     for (key, field) in [
         ("ai_endpoint", &mut s.ai.endpoint),
         ("ai_model", &mut s.ai.model),

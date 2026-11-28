@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub enum SettingsAction {
+    Wake(bool),
+    WakeWord(String),
     Tts(bool),
+    Voice(String),
     TestSpeech,
     RestartSpeech,
     CancelClarification,
@@ -30,7 +33,11 @@ pub enum SettingsAction {
 }
 
 pub struct SettingsView {
+    pub wake_enabled: bool,
+    wake_word: String,
     pub tts_enabled: bool,
+    pub voices: Vec<crate::speech::VoiceOption>,
+    pub tts_voice: String,
     pub tts_status: String,
     pub latency: crate::latency::LatencyHistory,
     pub clarifying: bool,
@@ -57,6 +64,10 @@ impl SettingsView {
     pub fn from_state(state: &NativeAppState) -> Self {
         Self {
             tts_enabled: state.tts_enabled,
+            wake_enabled: state.wake_enabled,
+            wake_word: state.wake_word.clone(),
+            voices: Vec::new(),
+            tts_voice: state.tts_voice.clone(),
             tts_status: String::new(),
             latency: Default::default(),
             clarifying: state.clarification.is_some(),
@@ -310,6 +321,23 @@ pub fn show(
                             ui.label(format!("按住 {} 回答，每轮一个重点。说“这个先待定”跳过当前问题。说“OK，就这样”或“停止”即可收尾，整理已确定和待定事项。说“直接输入”会输出上一段原话。", holdkey::label(&view.hold_key)));
                         } else if view.input_mode == InputMode::DesktopAssistant {
                             ui.label(format!("按住 {} 说出指令，例如“打开计算器”。松开后查看操作回执。", holdkey::label(&view.hold_key)));
+                            if ui.checkbox(&mut view.wake_enabled, "语音待机 · 用唤醒词开始").changed() {
+                                changes.push(SettingsAction::Wake(view.wake_enabled));
+                            }
+                            if view.wake_enabled {
+                                ui.horizontal(|ui| {
+                                    ui.label("唤醒词");
+                                    let word = ui.add(egui::TextEdit::singleline(&mut view.wake_word).char_limit(12).desired_width(130.0));
+                                    if word.changed() && crate::wake::valid_phrase(&view.wake_word) {
+                                        changes.push(SettingsAction::WakeWord(view.wake_word.clone()));
+                                    }
+                                });
+                                if !crate::wake::valid_phrase(&view.wake_word) {
+                                    ui.label("请输入 2 至 12 个汉字、字母或数字，输入有效后自动保存。");
+                                } else {
+                                    ui.label(format!("关闭设置后，单独说“{}”。听到提示音或看到“已唤醒”就可以说指令，停顿后自动提交。", view.wake_word));
+                                }
+                            }
                         }
                         let mut paste = view.auto_paste;
                         if ui.add_enabled(view.input_mode != InputMode::DesktopAssistant, egui::Checkbox::new(&mut paste, "识别后自动粘贴到原窗口")).changed() {
@@ -331,10 +359,21 @@ pub fn show(
                             changes.push(SettingsAction::Tts(view.tts_enabled));
                         }
                         ui.label("本地语音播报");
+                        if !view.voices.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                let view = &mut *view;
+                                ui.label("播报音色");
+                                for voice in &view.voices {
+                                    if ui.selectable_value(&mut view.tts_voice, voice.id.clone(), &voice.label).changed() {
+                                        changes.push(SettingsAction::Voice(voice.id.clone()));
+                                    }
+                                }
+                            });
+                        }
                         ui.label(&view.tts_status);
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(view.tts_enabled, egui::Button::new("试听提问"))
+                                .add_enabled(view.tts_enabled, egui::Button::new("试听音色"))
                                 .clicked()
                             {
                                 changes.push(SettingsAction::TestSpeech);

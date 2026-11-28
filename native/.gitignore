@@ -13,6 +13,7 @@
 /models/
 *.onnx
 *.wav
+!/assets/wake-cue.wav
 *.mp3
 *.flac
 *.m4a

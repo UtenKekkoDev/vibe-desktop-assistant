@@ -4,6 +4,7 @@
 use crate::audio::{cancel_recording, recording_level, take_recording_error};
 use crate::config;
 use crate::holdkey;
+use crate::processing_motion;
 use crate::services::{self, FeedbackLevel, FinishEvent, FinishInputResult};
 use crate::settings::{self, SettingsAction, SettingsView};
 use crate::state::{InputMode, InputState, ModelProvider, NativeAppState};
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const BAR_SIZE: [f32; 2] = [384.0, 64.0];
+pub const BAR_SIZE: [f32; 2] = processing_motion::SIZE;
 pub const WINDOW_TITLE: &str = "Vibe Desktop Assistant";
 
 /// Resting size: a small transparent square holding a single dot.
@@ -35,7 +36,6 @@ const SURFACE: Color32 = Color32::from_rgb(26, 28, 34);
 const BORDER: Color32 = Color32::from_rgb(58, 62, 72);
 const TEXT: Color32 = Color32::from_rgb(232, 234, 239);
 const MUTED: Color32 = Color32::from_rgb(146, 151, 162);
-const RECORDING: Color32 = Color32::from_rgb(255, 107, 94);
 const DONE: Color32 = Color32::from_rgb(109, 211, 160);
 const ERROR: Color32 = Color32::from_rgb(240, 118, 108);
 
@@ -48,12 +48,17 @@ enum Phase {
     Idle,
     Awaiting,
     Recording,
-    Processing,
+    Processing { started: Instant },
     Done { until: Instant, level: FeedbackLevel },
 }
 
 pub struct VoiceLiteApp {
     speech: crate::speech::SpeechOutput,
+    wake_listener: Option<crate::wake::Listener>,
+    wake_recording: bool,
+    wake_cue: Option<crate::wake::WakeCue>,
+    last_voice: Option<Instant>,
+    wake_after: Instant,
     ctx: Context,
     state: NativeAppState,
     phase: Phase,
@@ -128,6 +133,7 @@ impl eframe::App for VoiceLiteApp {
         };
         self.poll_finish();
         self.poll_hold_key(settings_focused);
+        self.poll_wake();
         self.expire_phase();
 
         // Resize to fit the current state, then paint into that size.
@@ -140,7 +146,7 @@ impl eframe::App for VoiceLiteApp {
         self.paint(ctx);
         self.persist();
 
-        let cadence = if matches!(self.phase, Phase::Recording) {
+        let cadence = if matches!(self.phase, Phase::Recording | Phase::Processing { .. }) {
             16
         } else {
             40
@@ -155,13 +161,24 @@ impl VoiceLiteApp {
         let first_launch = !config::has_saved_settings();
         let load_error = config::load(&mut state).err();
         let (settings_tx, settings_rx) = mpsc::channel();
-        let view = Arc::new(Mutex::new(SettingsView::from_state(&state)));
+        let voices = crate::speech::voice_options();
+        if !voices.iter().any(|v| v.id == state.tts_voice) {
+            state.tts_voice = voices.first().map(|v| v.id.clone()).unwrap_or_default();
+        }
+        let mut settings = SettingsView::from_state(&state);
+        settings.voices = voices;
+        let view = Arc::new(Mutex::new(settings));
         let tooltip = format!(
             "Vibe Desktop Assistant · 按住{}说话",
             holdkey::label(&state.hold_key)
         );
         let mut app = Self {
             speech: crate::speech::SpeechOutput::default(),
+            wake_listener: None,
+            wake_recording: false,
+            wake_cue: None,
+            last_voice: None,
+            wake_after: Instant::now(),
             ctx: ctx.clone(),
             state,
             phase: Phase::Idle,
@@ -221,7 +238,7 @@ impl VoiceLiteApp {
         let mode = mode.to_string_lossy().to_string();
         let next = match mode.as_str() {
             "rec" => Phase::Recording,
-            "proc" => Phase::Processing,
+            "proc" => Phase::Processing { started: self.started_at },
             "done" | "long" => Phase::Done {
                 until: Instant::now() + Duration::from_secs(3600),
                 level: FeedbackLevel::Success,
@@ -375,7 +392,7 @@ impl VoiceLiteApp {
         if !self.state.tts_enabled {
             return None;
         }
-        match self.speech.speak(text) {
+        match self.speech.speak(text, &self.state.tts_voice) {
             Ok(request) => Some(request),
             Err(error) => {
                 self.speech.status = format!("语音不可用：{error}；文字结果仍保留");
@@ -414,6 +431,7 @@ impl VoiceLiteApp {
     }
 
     fn reset_input(&mut self) {
+        self.wake_recording = false;
         self.choosing_mode = false;
         self.speech.stop();
         if let Some(task) = self.active_task.take() {
@@ -607,6 +625,45 @@ impl VoiceLiteApp {
         self.raise_bar();
     }
 
+    fn poll_wake(&mut self) {
+        if self.speech.is_speaking_or_queued() {
+            self.wake_after = Instant::now() + Duration::from_millis(650);
+        }
+        let armed = self.state.wake_enabled && self.state.input_mode == InputMode::DesktopAssistant
+            && self.model_ready && !self.settings_open && !self.last_down
+            && matches!(self.phase, Phase::Idle | Phase::Awaiting | Phase::Done { .. })
+            && Instant::now() >= self.wake_after && std::env::var_os("VIBE_DESKTOP_DEMO").is_none();
+        if !armed {
+            self.wake_listener.take();
+            return;
+        }
+        let heard = (|| -> anyhow::Result<bool> {
+            if self.wake_listener.is_none() {
+                let path = std::path::PathBuf::from(&self.state.local_model_dir);
+                let path = if path.join("tokens.txt").is_file() { path } else { crate::sensevoice::default_model_dir() };
+                self.wake_listener = Some(crate::wake::Listener::open(path, self.state.wake_word.clone())?);
+            }
+            self.wake_listener.as_ref().unwrap().heard()
+        })();
+        match heard {
+            Ok(true) => {
+                self.start_recording();
+                self.wake_recording = matches!(self.phase, Phase::Recording);
+                if self.wake_recording {
+                    self.wake_cue = Some(crate::wake::WakeCue::play());
+                }
+                self.last_voice = None;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.wake_listener.take();
+                self.state.wake_enabled = false;
+                if let Ok(mut view) = self.settings_view.lock() { view.wake_enabled = false; }
+                self.set_error(format!("语音待机已关闭：{err}"));
+            }
+        }
+    }
+
     fn watch_recording(&mut self) {
         if std::env::var_os("VIBE_DESKTOP_DEMO").is_some() {
             return;
@@ -617,6 +674,20 @@ impl VoiceLiteApp {
         if let Some(error) = take_recording_error() {
             cancel_recording();
             self.set_error(error);
+        } else if self.wake_recording {
+            if self.wake_cue.as_mut().is_some_and(|cue| cue.guarding(Instant::now())) {
+                return;
+            }
+            self.wake_cue = None;
+            let elapsed = self.recording_started_at.map(|t| t.elapsed()).unwrap_or_default();
+            if recording_level() >= 0.036 {
+                self.last_voice = Some(Instant::now());
+            }
+            if (self.last_voice.is_none() && elapsed >= Duration::from_secs(7)) || elapsed >= Duration::from_secs(45) {
+                self.reset_input();
+            } else if self.last_voice.is_some_and(|t| t.elapsed() >= Duration::from_millis(900)) {
+                self.stop_recording();
+            }
         } else if self
             .recording_started_at
             .is_some_and(|started| started.elapsed() >= MAX_HOLD)
@@ -633,7 +704,9 @@ impl VoiceLiteApp {
         let esc =
             unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) } < 0;
         if esc && !self.esc_down && !settings_focused {
-            if self.choosing_mode {
+            if self.wake_recording {
+                self.reset_input();
+            } else if self.choosing_mode {
                 self.handle_mode_command(ModeCommand::Cancel);
             } else if self.state.clarification.is_some()
                 && matches!(self.phase, Phase::Awaiting | Phase::Done { .. })
@@ -664,12 +737,15 @@ impl VoiceLiteApp {
             } else {
                 self.start_recording();
             }
-        } else if !down && matches!(self.phase, Phase::Recording) {
+        } else if !down && !self.wake_recording && matches!(self.phase, Phase::Recording) {
             self.stop_recording();
         }
     }
 
     fn start_recording(&mut self) {
+        self.wake_listener.take();
+        self.wake_cue = None;
+        self.wake_recording = false;
         self.speech.stop();
         if !self.model_ready {
             self.set_error("模型未就绪 · 托盘 → 设置");
@@ -697,6 +773,7 @@ impl VoiceLiteApp {
     }
 
     fn stop_recording(&mut self) {
+        self.wake_recording = false;
         let released = crate::latency::ReleaseTime::now();
         let elapsed = self
             .recording_started_at
@@ -724,7 +801,7 @@ impl VoiceLiteApp {
                 self.active_task = Some(task.clone());
                 let (tx, rx) = mpsc::channel();
                 self.pending = Some(rx);
-                self.phase = Phase::Processing;
+                self.phase = Phase::Processing { started: Instant::now() };
                 let ctx = self.ctx.clone();
                 let choosing_mode = self.choosing_mode;
                 thread::spawn(move || {
@@ -764,6 +841,7 @@ impl VoiceLiteApp {
     }
 
     fn set_error(&mut self, message: impl Into<String>) {
+        self.wake_recording = false;
         if let Some(task) = self.active_task.take() {
             task.cancel();
         }
@@ -841,6 +919,11 @@ impl VoiceLiteApp {
                 }
             }
             match action {
+                SettingsAction::Wake(on) => {
+                    self.state.wake_enabled = on;
+                    if !on && self.wake_recording { self.reset_input(); }
+                }
+                SettingsAction::WakeWord(word) => self.state.wake_word = word,
                 SettingsAction::Tts(on) => {
                     self.state.tts_enabled = on;
                     if on {
@@ -851,8 +934,14 @@ impl VoiceLiteApp {
                         self.speech.shutdown();
                     }
                 }
+                SettingsAction::Voice(voice) => {
+                    if self.state.tts_voice != voice {
+                        self.speech.stop();
+                        self.state.tts_voice = voice;
+                    }
+                }
                 SettingsAction::TestSpeech => {
-                    self.say("需要确认一下：你说的是访问令牌，还是刷新令牌？");
+                    self.say("明天下午三点半，记得提醒我一下。");
                 }
                 SettingsAction::RestartSpeech => {
                     self.speech.shutdown();
@@ -981,7 +1070,7 @@ impl VoiceLiteApp {
                 self.result_shown = shown;
                 (CARD_W, height)
             }
-            _ => (BAR_SIZE[0], BAR_SIZE[1]),
+            Phase::Recording | Phase::Processing { .. } => (BAR_SIZE[0], BAR_SIZE[1]),
         };
         let size_changed =
             (self.geometry[0] - w).abs() >= 0.5 || (self.geometry[1] - h).abs() >= 0.5;
@@ -1014,6 +1103,9 @@ impl VoiceLiteApp {
                 let painter = ui.painter();
                 let rect = Rect::from_min_size(Pos2::ZERO, vec2(width, height));
                 match phase {
+                    Phase::Idle if self.wake_listener.is_some() => {
+                        painter.circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5_f32, DONE));
+                    }
                     Phase::Idle => paint_dot(painter, rect),
                     Phase::Done { level, .. } => paint_card(
                         painter,
@@ -1059,38 +1151,17 @@ impl VoiceLiteApp {
                         &self.result_text,
                         note.as_deref(),
                     ),
-                    Phase::Recording => paint_pill(
-                        painter,
-                        rect,
-                        PillState::Recording {
-                            level: recording_level(),
-                            elapsed: &elapsed,
-                            hint: &format!("松开 {key} 结束并识别"),
-                        },
+                    Phase::Recording => processing_motion::paint_recording(
+                        painter, rect, recording_level(), &elapsed,
+                        &if self.wake_recording { "已唤醒 · 请说指令".into() } else { format!("松开 {key} 结束") },
                     ),
-                    Phase::Processing => paint_pill(
-                        painter,
-                        rect,
-                        PillState::Processing {
-                            time: ctx.input(|i| i.time) as f32,
-                            submitted: self.active_task.as_ref().is_some_and(|t| t.search_submitted.get().is_some()),
-                        },
+                    Phase::Processing { started } => processing_motion::paint(
+                        painter, rect, started.elapsed().as_secs_f32(),
+                        self.active_task.as_ref().is_some_and(|t| t.search_submitted.get().is_some()),
                     ),
                 }
             });
     }
-}
-
-enum PillState<'a> {
-    Recording {
-        level: f32,
-        elapsed: &'a str,
-        hint: &'a str,
-    },
-    Processing {
-        time: f32,
-        submitted: bool,
-    },
 }
 
 fn paint_dot(painter: &egui::Painter, rect: Rect) {
@@ -1099,84 +1170,6 @@ fn paint_dot(painter: &egui::Painter, rect: Rect) {
         5.0,
         Color32::from_rgba_unmultiplied(150, 155, 166, 120),
     );
-}
-
-fn paint_pill(painter: &egui::Painter, rect: Rect, state: PillState<'_>) {
-    let radius = rect.height() / 2.0;
-    // Soft drop shadow, then the capsule itself.
-    painter.rect_filled(
-        rect.translate(vec2(0.0, 3.0)),
-        radius,
-        Color32::from_black_alpha(70),
-    );
-    painter.rect_filled(rect.shrink(1.0), radius - 1.0, SURFACE);
-    painter.rect_stroke(
-        rect.shrink(1.0),
-        radius - 1.0,
-        Stroke::new(1.0_f32, BORDER),
-        StrokeKind::Inside,
-    );
-
-    let at = |x: f32, y: f32| Pos2::new(rect.left() + x, rect.top() + y);
-
-    match state {
-        PillState::Recording {
-            level,
-            elapsed,
-            hint,
-        } => {
-            let level = level.clamp(0.0, 1.0);
-            for (index, weight) in [0.35_f32, 0.65, 1.0, 0.8, 0.5].iter().enumerate() {
-                let bar = 4.0 + 24.0 * level * weight;
-                painter.rect_filled(
-                    Rect::from_center_size(at(30.0 + index as f32 * 9.0, 32.0), vec2(4.0, bar)),
-                    2,
-                    RECORDING,
-                );
-            }
-            painter.text(
-                at(86.0, 23.0),
-                Align2::LEFT_CENTER,
-                "正在听…",
-                FontId::proportional(15.0),
-                TEXT,
-            );
-            painter.text(
-                at(rect.width() - 22.0, 23.0),
-                Align2::RIGHT_CENTER,
-                elapsed,
-                FontId::monospace(14.0),
-                MUTED,
-            );
-            painter.text(
-                at(86.0, 43.0),
-                Align2::LEFT_CENTER,
-                hint,
-                FontId::proportional(11.0),
-                MUTED,
-            );
-        }
-        PillState::Processing { time, submitted } => {
-            for index in 0..3 {
-                let pulse = ((time * 3.0) - index as f32 * 0.6).sin() * 0.5 + 0.5;
-                painter.circle_filled(at(30.0 + index as f32 * 9.0, 32.0), 2.0 + 1.8 * pulse, DONE);
-            }
-            painter.text(
-                at(86.0, 23.0),
-                Align2::LEFT_CENTER,
-                if submitted { "已提交搜索" } else { "处理中…" },
-                FontId::proportional(15.0),
-                TEXT,
-            );
-            painter.text(
-                at(86.0, 43.0),
-                Align2::LEFT_CENTER,
-                if submitted { "正在核对 Steam 结果页" } else { "松开后就交给本地模型" },
-                FontId::proportional(11.0),
-                MUTED,
-            );
-        }
-    }
 }
 
 fn question_footer(c: &crate::ai::Clarification) -> &'static str {
@@ -1564,6 +1557,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wake_recording_waits_without_a_key_and_times_out_without_submitting() {
+        let mut app = test_app();
+        app.phase = Phase::Recording;
+        app.state.input_state = InputState::Recording;
+        app.wake_recording = true;
+        app.recording_started_at = Some(Instant::now() - Duration::from_secs(8));
+        app.handle_hold_key(false, false);
+        assert!(matches!(app.phase, Phase::Recording));
+        app.watch_recording();
+        assert!(matches!(app.phase, Phase::Idle));
+        assert!(!app.wake_recording && app.pending.is_none());
+    }
+
+    #[test]
+    fn selected_voice_survives_a_settings_round_trip_with_speech_off() {
+        let mut app = test_app();
+        for id in ["voice-1", "voice-2", "voice-1"] {
+            app.settings_tx.send(SettingsAction::Voice(id.into())).unwrap();
+            app.drain_settings();
+            let mut restored = NativeAppState::default();
+            config::apply(&mut restored, &config::snapshot(&app.state));
+            assert_eq!(restored.tts_voice, id);
+            assert!(!restored.tts_enabled);
+        }
+    }
+
     fn test_app() -> std::mem::ManuallyDrop<VoiceLiteApp> {
         let state = NativeAppState {
             tts_enabled: false,
@@ -1573,6 +1593,11 @@ mod tests {
         let (settings_tx, settings_rx) = mpsc::channel();
         std::mem::ManuallyDrop::new(VoiceLiteApp {
             speech: crate::speech::SpeechOutput::default(),
+            wake_listener: None,
+            wake_recording: false,
+            wake_cue: None,
+            last_voice: None,
+            wake_after: Instant::now(),
             ctx: Context::default(),
             settings_view: Arc::new(Mutex::new(SettingsView::from_state(&state))),
             saved_config: config::snapshot(&state),

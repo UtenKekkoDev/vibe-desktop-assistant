@@ -62,7 +62,10 @@ pub enum InputState {
 
 #[derive(Clone)]
 pub struct NativeAppState {
+    pub wake_enabled: bool,
+    pub wake_word: String,
     pub tts_enabled: bool,
+    pub tts_voice: String,
     pub clarification: Option<crate::ai::Clarification>,
     pub ai: crate::ai::AiConfig,
     pub ai_status: String,
@@ -107,6 +110,9 @@ impl Default for NativeAppState {
     fn default() -> Self {
         Self {
             tts_enabled: true,
+            wake_enabled: false,
+            wake_word: "小助手".into(),
+            tts_voice: String::new(),
             clarification: None,
             ai: crate::ai::AiConfig::default(),
             ai_status: String::new(),

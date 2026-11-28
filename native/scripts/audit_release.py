@@ -1,5 +1,6 @@
 """Check the Git index before publication. Reports paths/rules, never secret values."""
 from pathlib import Path
+import hashlib
 import re
 import struct
 import subprocess
@@ -18,10 +19,12 @@ if not paths:
 issues = []
 for name in paths:
     path = Path(name)
-    if (path.suffix.lower() in {".exe", ".dll", ".onnx", ".safetensors", ".wav", ".mp3", ".pyc", ".log", ".npz"}
+    data = indexed_blob(name)
+    public_cue = (name == f"{assets}/wake-cue.wav" and
+                  hashlib.sha256(data).hexdigest() == "689577e5ffdf564cd9edaced340bfedf000bf01f12a303acd75296fc5afa650e")
+    if (path.suffix.lower() in {".exe", ".dll", ".onnx", ".safetensors", ".wav", ".mp3", ".pyc", ".log", ".npz"} and not public_cue
             or "__pycache__" in path.parts or path.name in {"runtime.json", "settings.json", ".env"}):
         issues.append((name, "private/runtime/generated artifact"))
-    data = indexed_blob(name)
     if len(data) > 5_000_000:
         issues.append((name, "unexpected large file"))
     if b"\0" in data[:8192]:

@@ -113,10 +113,14 @@ export class Session {
   async #run(text, task, initialBinding, windowHandle) {
     const signal = task.controller.signal;
     let start = initialBinding === undefined ? await this.#snapshot(signal) : initialBinding;
-    const context = { target: start?.chatApp || start?.target || '', chatApp: start?.chatApp,
+    const currentWeChat = Boolean(start?.recipient && start.isForeground && start.sendAvailable);
+    const context = { target: start?.chatApp || start?.target || '', chatApp: start?.chatApp, currentWeChat,
       draft: start?.draft ? '当前输入框有草稿' : '' };
-    if (this.#pending) context.clarification = { ...this.#pending };
     const pending = this.#pending;
+    if (pending) {
+      const { original, question, answers, weChat } = pending;
+      context.clarification = { original, question, answers, weChat };
+    }
     const selection = this.#selection;
     this.#selection = null;
     const ordinal = selection && /^(?:我?选)?第?([一二两三四五六七八九十]|\d+)个?[。！？!?]?$/u.exec(text.trim());
@@ -127,16 +131,21 @@ export class Session {
     }
     const replyingWithWeChat = pending && /发|寄送/u.test(pending.original)
       && /^(?:在|用)?\s*(?:微信|wechat)(?:里|里面|上)?[。！？!?]?$/iu.test(text.trim());
-    let decision = ordinal ? selection.decision : replyingWithWeChat
-      ? { intent: 'clarify', value: '要在微信里发给谁？请说出收件人，以及要发送的正文或草稿。' }
+    let decision = ordinal ? selection.decision : replyingWithWeChat && !currentWeChat
+      ? { intent: 'clarify', value: '请打开要发送的微信聊天，或说出收件人。' }
       : await this.#decide(text, context, { signal });
     signal.throwIfAborted();
     if (decision.intent === 'clarify') {
       this.#pending = { original: pending?.original ?? text, question: decision.value,
-        answers: pending ? [...pending.answers, text] : [], weChat: Boolean(replyingWithWeChat || pending?.weChat) };
+        answers: pending ? [...pending.answers, text] : [], weChat: Boolean(replyingWithWeChat || pending?.weChat),
+        chatIdentity: pending?.chatIdentity ?? (currentWeChat ? start.identity : null) };
       return result('clarify', decision.value);
     }
     this.#pending = null;
+    if (pending?.chatIdentity && !decision.recipient && ['send_draft','fill_send'].includes(decision.intent)
+        && start?.identity !== pending.chatIdentity) {
+      return result('target_changed', '微信聊天已切换，请在要发送的聊天里重新说完整指令。');
+    }
     if (['list_controls','focus_control','press_button'].includes(decision.intent)) {
       const hwnd = windowHandle === undefined ? start?.hwnd : windowHandle;
       if (!hwnd) return result('clarify', '请切到目标窗口，再说一次。');
@@ -178,7 +187,11 @@ export class Session {
       }
       start = { ...start, requiredRecipient: decision.recipient };
     }
-    if (pending?.weChat && ['fill_text','send_draft','fill_send'].includes(decision.intent) && !start?.recipient) {
+    if (!decision.recipient && !currentWeChat && (pending?.weChat || replyingWithWeChat || start?.isWeChat)
+        && ['send_draft','fill_send'].includes(decision.intent)) {
+      return result('clarify', '请先打开要发送的微信聊天，再说一次。');
+    }
+    if (pending?.weChat && decision.intent === 'fill_text' && !start?.recipient) {
       return result('clarify', '请先切换到目标微信聊天，再重复发送指令。');
     }
     if (decision.intent === 'steam_search') {
@@ -209,7 +222,8 @@ export class Session {
     const clearedAfterSubmit = previous && previous.identity === start.identity
       && start.draft === '' && this.#sent.get(start.identity)?.draft === previous.draft;
     const usesExistingDraft = ['read_draft', 'replace_text', 'send_draft'].includes(decision.intent);
-    if (usesExistingDraft && previous && !sameDraft(start, previous) && !clearedAfterSubmit) {
+    const useVisibleDraft = currentWeChat && decision.currentChat && decision.intent === 'send_draft';
+    if (usesExistingDraft && !useVisibleDraft && previous && !sameDraft(start, previous) && !clearedAfterSubmit) {
       return result('target_changed', '当前输入框或草稿和上次不同。要操作眼前的草稿，请单独说“使用当前窗口”后重试。');
     }
     if (!sameDraft(start, await this.#snapshot(signal))) {

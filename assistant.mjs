@@ -68,7 +68,8 @@ export function createAssistant(options, { decide = classify, desktop = bridge, 
     },
     decide(text, ctx, { signal }) {
       // 只发送是否有草稿；引用片段按原指令提取，草稿全文留在本机。
-      return decide(text, { target: ctx.target, chatApp: ctx.chatApp, draft: ctx.draft ? '已有草稿' : '', clarification: ctx.clarification,
+      return decide(text, { target: ctx.target, chatApp: ctx.chatApp, currentWeChat: ctx.currentWeChat,
+        draft: ctx.draft ? '已有草稿' : '', clarification: ctx.clarification,
         sessionMode: true, budgetsAvailable, budgetCompared, budgetCategory }, { signal });
     },
     async apply(decision, binding, { signal }) {

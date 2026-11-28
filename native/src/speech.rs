@@ -87,7 +87,33 @@ fn runtime_dir() -> PathBuf {
                 .join("tts")
         })
 }
+#[derive(serde::Deserialize)]
+pub struct VoiceOption {
+    pub id: String,
+    pub label: String,
+}
+
+pub fn voice_options() -> Vec<VoiceOption> {
+    let Ok(bytes) = std::fs::read(runtime_dir().join("runtime.json")) else {
+        return Vec::new();
+    };
+    #[derive(serde::Deserialize)]
+    struct Runtime {
+        engine: Option<String>,
+        #[serde(default)]
+        voices: Vec<VoiceOption>,
+    }
+    match serde_json::from_slice::<Runtime>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)) {
+        Ok(config) if config.engine.as_deref() == Some("v5_turbo") => config.voices,
+        _ => Vec::new(),
+    }
+}
+
 impl SpeechOutput {
+    pub fn is_speaking_or_queued(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.child.is_some() {
             return Ok(());
@@ -185,13 +211,13 @@ impl SpeechOutput {
             .send(v)
             .context("语音指令管道已关闭")
     }
-    pub fn speak(&mut self, text: &str) -> Result<u64> {
+    pub fn speak(&mut self, text: &str, voice: &str) -> Result<u64> {
         if text.trim().is_empty() || text.chars().count() > 500 {
             bail!("播报内容为空或过长，请查看文字结果");
         }
         self.start()?;
         self.request += 1;
-        self.send(json!({"cmd":"speak","id":self.request,"text":text}))?;
+        self.send(json!({"cmd":"speak","id":self.request,"text":text,"voice":voice}))?;
         self.active = Some(Instant::now());
         self.status = if self.ready {
             "正在准备播报…"
@@ -330,7 +356,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(20));
         }
-        s.speak("需要确认一下，你说的是访问令牌过期，还是刷新令牌过期？")
+        s.speak("需要确认一下，你说的是访问令牌过期，还是刷新令牌过期？", "")
             .unwrap();
         while s.status != "正在播报…" {
             s.poll().unwrap();
@@ -339,7 +365,7 @@ mod tests {
         }
         s.stop();
         assert!(s.active.is_none());
-        s.speak("已整理完成。").unwrap();
+        s.speak("已整理完成。", "").unwrap();
         while s.active.is_some() {
             s.poll().unwrap();
             assert!(Instant::now() < deadline);

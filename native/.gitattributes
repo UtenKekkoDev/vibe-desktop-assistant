@@ -2,6 +2,8 @@
 *.png binary
 *.ico binary
 *.rgba binary
+*.rgb binary
+*.wav binary
 # Preserve upstream Python formatting without treating it as project whitespace.
 tts/faster_qwen3_tts/** -whitespace
 vendor/** -whitespace
