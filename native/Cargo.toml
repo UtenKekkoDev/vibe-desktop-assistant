@@ -1,6 +1,6 @@
 [package]
 name = "vibe-desktop-assistant"
-version = "0.2.0-preview.3"
+version = "0.2.0-preview.4"
 edition = "2024"
 authors = ["Yuxuan Sun"]
 description = "Windows voice desktop assistant derived from Vibe Voice Lite."

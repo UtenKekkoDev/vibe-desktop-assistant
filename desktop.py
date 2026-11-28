@@ -78,11 +78,24 @@ class Editor:
             raise DesktopActionError("目标窗口或草稿已变化，请重新指定。")
 
     def read(self):
+        value = self.pattern.Value or ""
         if self.chat_app:
             children = self.control.GetChildren()
-            if len(children) == 1 and "is-editor-empty" in children[0].ClassName.split():
-                return ""
-        return self.pattern.Value or ""
+            if len(children) == 1:
+                paragraph = children[0]
+                classes = paragraph.ClassName.split()
+                if "is-editor-empty" in classes:
+                    return ""
+                if self.chat_app == "Codex" and "before:composer-placeholder" in classes:
+                    # Chromium includes the CSS hint and trailing break in UIA Value.
+                    parts = paragraph.GetChildren()
+                    if (len(parts) == 2 and parts[0].ControlTypeName == "GroupControl"
+                            and "ProseMirror-trailingBreak" in parts[1].ClassName.split()):
+                        hint = parts[0].GetChildren()
+                        if (len(hint) == 1 and hint[0].ControlTypeName == "TextControl"
+                                and value.rstrip("\r\n") == hint[0].Name):
+                            return ""
+        return value
 
 
 def bind_editor(title, field, chat_hwnd=None):

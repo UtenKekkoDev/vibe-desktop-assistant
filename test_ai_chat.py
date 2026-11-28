@@ -4,6 +4,27 @@ from unittest.mock import Mock, patch
 import desktop as d
 
 
+class ComposerText(unittest.TestCase):
+    def test_generated_codex_hint_is_empty_but_identical_typed_text_is_a_draft(self):
+        hint = "和 Codex 一起工作"
+        text = Mock(ControlTypeName="TextControl", Name=hint)
+        decoration = Mock(ControlTypeName="GroupControl")
+        decoration.GetChildren.return_value = [text]
+        paragraph = Mock(ClassName="placeholder before:composer-placeholder")
+        paragraph.GetChildren.return_value = [decoration, Mock(ClassName="ProseMirror-trailingBreak")]
+        control = Mock()
+        control.GetChildren.return_value = [paragraph]
+        pattern = Mock(Value=hint + "\n")
+        editor = d.Editor(1, "", 1, control, pattern, "", "Codex")
+        self.assertEqual(editor.read(), "")
+        pattern.Value = hint + "，继续"
+        self.assertEqual(editor.read(), pattern.Value)
+        paragraph.ClassName = ""
+        paragraph.GetChildren.return_value = [text]
+        pattern.Value = hint
+        self.assertEqual(editor.read(), hint)
+
+
 class ChatSubmit(unittest.TestCase):
     def simulate(self, after_key, counts):
         doc = Mock()
